@@ -140,7 +140,13 @@ fn delete_credentials() -> Result<bool, String> {
 }
 
 /// Open a URL in the user's browser; best-effort (the user_code is the fallback).
+/// `TINA4_NO_BROWSER` (the same opt-out `serve` honours) suppresses the launch, so
+/// headless/CI runs and the auth tests never pop a window - the printed URL and
+/// user_code remain the fallback.
 fn open_browser(url: &str) -> bool {
+    if std::env::var("TINA4_NO_BROWSER").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        return false;
+    }
     let status = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).stdout(Stdio::null()).stderr(Stdio::null()).status()
     } else if cfg!(windows) {
@@ -324,9 +330,16 @@ pub fn logout() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serializes every test that mutates process-wide env (TINA4_PROFILE_URL, HOME,
+    // XDG_CONFIG_HOME, TINA4_NO_BROWSER). Rust runs tests in parallel threads in one
+    // process, so without this they would clobber each other's env.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn base_url_defaults_and_trims_override() {
+        let _g = ENV_LOCK.lock().unwrap();
         // Pure: no network. Default when unset; override wins and the trailing slash goes.
         std::env::remove_var("TINA4_PROFILE_URL");
         assert_eq!(base_url(), DEFAULT_PROFILE_URL);
@@ -373,6 +386,7 @@ mod tests {
 
     #[test]
     fn config_dir_is_under_xdg_when_set() {
+        let _g = ENV_LOCK.lock().unwrap();
         #[cfg(not(windows))]
         {
             std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdgtest");
