@@ -5,6 +5,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 pub mod console;
+mod ai_gateway;
+mod auth;
 mod deploy;
 mod env_config;
 mod env_migrate;
@@ -144,6 +146,9 @@ enum Commands {
 
     /// Detect AI coding tools and install framework context/skills
     Ai {
+        /// Subcommand (e.g. `serve`). Omit to install AI-tool context as before.
+        #[command(subcommand)]
+        command: Option<AiSubcommand>,
         /// Install context for ALL known AI tools (not just detected ones)
         #[arg(long)]
         all: bool,
@@ -151,6 +156,22 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Sign in to your Tina4 profile with GitHub (first login creates it) at profile.tina4.com
+    Login,
+
+    /// Create a Tina4 profile (opens sign-up), then sign in with GitHub
+    Register,
+
+    /// Show the signed-in Tina4 profile
+    Whoami {
+        /// Print as JSON (for tooling / dev-admin)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Sign out and remove the stored credentials
+    Logout,
 
     /// Install the latest Tina4 AI skills for Claude, Codex, Cursor, or all
     Skills {
@@ -263,6 +284,20 @@ enum Commands {
     /// nothing (`--fix` applies safe autofixes when the detected tool supports them).
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum AiSubcommand {
+    /// Run the local AI gateway: registration-gated, streams, falls back to Ollama.
+    /// Fails fast unless you are signed in AND a model backend is answering.
+    Serve {
+        /// Port to listen on (default 11435)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Backend URL override (default: auto-detect ai-server :11437 then Ollama :11434)
+        #[arg(long)]
+        backend: Option<String>,
+    },
 }
 
 fn main() {
@@ -469,17 +504,25 @@ fn main() {
         // out of parity with the framework's command surface.
         Commands::External(args) => delegate_command(args),
 
-        Commands::Ai { all, force } => {
-            // Check if this is a tina4-js (frontend) project — handle directly
-            if is_tina4js_project() {
-                handle_tina4js_ai(all, force);
-            } else {
-                let mut args = vec!["ai".to_string()];
-                if all { args.push("--all".into()); }
-                if force { args.push("--force".into()); }
-                delegate_command(args);
+        Commands::Ai { command, all, force } => match command {
+            Some(AiSubcommand::Serve { port, backend }) => ai_gateway::serve(port, backend),
+            None => {
+                // Check if this is a tina4-js (frontend) project — handle directly
+                if is_tina4js_project() {
+                    handle_tina4js_ai(all, force);
+                } else {
+                    let mut args = vec!["ai".to_string()];
+                    if all { args.push("--all".into()); }
+                    if force { args.push("--force".into()); }
+                    delegate_command(args);
+                }
             }
-        }
+        },
+
+        Commands::Login => auth::login(),
+        Commands::Register => auth::register(),
+        Commands::Whoami { json } => auth::whoami(json),
+        Commands::Logout => auth::logout(),
 
         Commands::Skills { target } => {
             let ok = match target {
