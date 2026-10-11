@@ -251,6 +251,11 @@ enum Commands {
         /// (warns and passes). Independent of --fail-on; either may trip the exit.
         #[arg(long = "fail-on-regression")]
         fail_on_regression: bool,
+        /// Print each offender's stable rule id and a suggested refactoring
+        /// move under its row. Opt-in and additive: the default table is
+        /// unchanged, and `--json` always carries `rule_id` and `remedy`.
+        #[arg(long)]
+        suggest: bool,
     },
 
     /// Any command the client doesn't own is forwarded verbatim to the detected
@@ -449,7 +454,7 @@ fn main() {
         // Native, language-agnostic metrics engine (ADR-0002). No longer
         // forwarded to the framework CLI — scans SOURCE directly, no project
         // or running framework required.
-        Commands::Metrics { path, fail_on, json, top, exclude, include_non_production, no_history, fail_on_regression } => {
+        Commands::Metrics { path, fail_on, json, top, exclude, include_non_production, no_history, fail_on_regression, suggest } => {
             std::process::exit(metrics::run(metrics::RunOptions {
                 path,
                 top,
@@ -459,6 +464,7 @@ fn main() {
                 include_non_production,
                 no_history,
                 fail_on_regression,
+                suggest,
             }));
         }
 
