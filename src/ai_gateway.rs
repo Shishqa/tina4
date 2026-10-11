@@ -105,6 +105,21 @@ pub fn serve(port: Option<u16>, backend: Option<String>) {
     });
 }
 
+/// Guard the proxied path before it is appended to the trusted backend base.
+/// `rest` is caller-supplied (the `/api/{*rest}` wildcard), and it flows straight
+/// into `format!("{backend}/api/{rest}")`, so it must be a PLAIN path: nothing
+/// that could re-point the request at another host (a `://` scheme, an `@`
+/// authority), climb out with `..`, or smuggle control characters / CRLF. The
+/// backend's host is already pinned by `resolve_backend`; this is what keeps the
+/// URL's host from being influenced by the path, and closes the SSRF surface.
+fn safe_proxy_path(rest: &str) -> bool {
+    if rest.is_empty() || rest.len() > 256 || rest.contains("://") || rest.contains("..") {
+        return false;
+    }
+    rest.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+}
+
 /// POST /api/<rest> - gate, pick a backend, forward verbatim, stream the reply back.
 async fn proxy(State(state): State<GwState>, Path(rest): Path<String>, body: Bytes) -> Response {
     // Registration gate: no local credentials => not signed up on profile.
@@ -114,6 +129,16 @@ async fn proxy(State(state): State<GwState>, Path(rest): Path<String>, body: Byt
             Json(serde_json::json!({
                 "error": "not signed in - run `tina4 login` (free profile at https://profile.tina4.com)"
             })),
+        )
+            .into_response();
+    }
+
+    // SSRF guard: a path that is not a plain path segment sequence is refused
+    // before it can shape the upstream URL (see safe_proxy_path).
+    if !safe_proxy_path(&rest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid API path" })),
         )
             .into_response();
     }
@@ -215,6 +240,24 @@ mod tests {
             !port_open(free_port),
             "a port with no listener must read as closed"
         );
+    }
+
+    #[test]
+    fn safe_proxy_path_allows_plain_paths_and_rejects_ssrf_shapes() {
+        // Real Ollama-native endpoints pass.
+        assert!(safe_proxy_path("chat"));
+        assert!(safe_proxy_path("generate"));
+        assert!(safe_proxy_path("embeddings"));
+        assert!(safe_proxy_path("some/nested/path-1_2"));
+        // Anything that could re-point the host, climb out, or smuggle control
+        // chars / a query is refused.
+        assert!(!safe_proxy_path(""));
+        assert!(!safe_proxy_path("http://evil.example/x"));
+        assert!(!safe_proxy_path("chat@evil.example"));
+        assert!(!safe_proxy_path("../../etc/passwd"));
+        assert!(!safe_proxy_path("chat\r\nHost: evil"));
+        assert!(!safe_proxy_path("chat?x=1"));
+        assert!(!safe_proxy_path(&"a".repeat(257)));
     }
 
     #[test]
