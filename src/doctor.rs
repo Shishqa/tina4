@@ -184,6 +184,9 @@ pub fn run() {
         println!("  {} {:<16} {:<12} {}", icon, cli.name, cli.lang, status_text);
     }
 
+    // --- CodeQL (optional, powers `tina4 codeql`) ---
+    check_codeql();
+
     // --- Tina4 AI skills (global ~/.claude/skills) ---
     check_skills_currency();
     check_codex_skills_currency();
@@ -325,6 +328,51 @@ fn check_tool(commands: &[&str], version_flag: &str) -> (bool, String) {
         }
     }
     (false, String::new())
+}
+
+/// Report the CodeQL CLI that powers `tina4 codeql`. It is OPTIONAL -- a pre-check
+/// developers opt into, not a runtime requirement -- so a missing one is a warn
+/// with the platform's install command, never a hard failure. CodeQL has no
+/// native package on Windows/Linux, so those fall back to the gh extension or the
+/// official release zip.
+fn check_codeql() {
+    println!();
+    println!("  {}", "CodeQL pre-check (tina4 codeql)".bold());
+    println!("  {}", "─".repeat(70));
+
+    let packs = "codeql pack download codeql/javascript-queries codeql/ruby-queries \
+codeql/python-queries codeql/actions-queries";
+    let (found, version) = check_tool(&["codeql"], "version");
+    if found {
+        let shown = if version.is_empty() {
+            "installed".to_string()
+        } else {
+            format!("installed  {version}")
+        };
+        println!("  {} {:<28} {}", icon_ok().green(), "codeql CLI", shown.cyan());
+        println!("       {} {}", "packs:".dimmed(), packs.dimmed());
+    } else {
+        let install = if cfg!(target_os = "macos") {
+            "brew install codeql".to_string()
+        } else if cfg!(target_os = "windows") {
+            "gh extensions install github/gh-codeql   \
+(or download codeql-win64.zip from github.com/github/codeql-cli-binaries/releases and add it to PATH)"
+                .to_string()
+        } else {
+            "brew install codeql   \
+(or download codeql-linux64.zip from github.com/github/codeql-cli-binaries/releases and add it to PATH)"
+                .to_string()
+        };
+        println!(
+            "  {} {:<28} {}  {}  {}",
+            icon_warn().yellow(),
+            "codeql CLI",
+            "not found (optional)".dimmed(),
+            "→".dimmed(),
+            format!("run: {install}").yellow()
+        );
+        println!("       {} {}", "then:".dimmed(), packs.yellow());
+    }
 }
 
 fn strip_ansi(s: &str) -> String {
