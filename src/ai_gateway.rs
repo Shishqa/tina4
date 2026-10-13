@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{header, HeaderName, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -93,7 +94,12 @@ pub fn serve(port: Option<u16>, backend: Option<String>) {
             // Proxy ANY Ollama-native model endpoint (/api/chat, /api/generate,
             // /api/embeddings, ...) so dev-admin never needs a path straight to a model.
             .route("/api/{*rest}", post(proxy))
-            .with_state(state);
+            .with_state(state)
+            // dev-admin runs in the browser on another local port (the framework
+            // dev server, or the SPA dev port), so talking to :11435 is cross-origin.
+            // This gateway only ever listens on loopback and gates on local creds,
+            // so it reflects the caller's Origin and answers the preflight.
+            .layer(middleware::from_fn(cors));
 
         println!("{} Tina4 AI gateway on http://127.0.0.1:{port}  (POST /api/chat)", icon_ok());
         println!("{} signed in, backend live: {backend}", icon_info());
@@ -118,6 +124,47 @@ fn safe_proxy_path(rest: &str) -> bool {
     }
     rest.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+}
+
+/// CORS for the browser-based dev-admin SPA. The gateway binds loopback only and
+/// gates every proxied call on local `tina4 login` credentials, so opening CORS
+/// here does not widen the trust boundary - only a page already on this machine
+/// can reach :11435. A preflight (OPTIONS) is answered here without routing; every
+/// other response gets the headers added on the way out. The caller's Origin is
+/// reflected (with `Vary: Origin`) and `Access-Control-Allow-Private-Network` is
+/// set so Chrome's Private Network Access check passes when a localhost page calls
+/// 127.0.0.1.
+async fn cors(req: Request, next: Next) -> Response {
+    let origin = req.headers().get(header::ORIGIN).cloned();
+    let req_headers = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+    let is_preflight = req.method() == Method::OPTIONS;
+
+    let mut resp = if is_preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(req).await
+    };
+
+    let h = resp.headers_mut();
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        origin.unwrap_or_else(|| HeaderValue::from_static("*")),
+    );
+    h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        req_headers.unwrap_or_else(|| HeaderValue::from_static("content-type, authorization")),
+    );
+    h.insert(
+        HeaderName::from_static("access-control-allow-private-network"),
+        HeaderValue::from_static("true"),
+    );
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+    resp
 }
 
 /// POST /api/<rest> - gate, pick a backend, forward verbatim, stream the reply back.
@@ -298,6 +345,60 @@ mod tests {
             assert!(
                 !backend_alive(&client, &dead_url).await,
                 "a port with no HTTP server must not be reported alive"
+            );
+        });
+    }
+
+    #[test]
+    fn cors_answers_preflight_and_tags_normal_responses() {
+        // No mock: a REAL server carrying the exact `cors` layer the gateway uses.
+        // The browser dev-admin SPA on another local port must get a preflight
+        // answer and CORS headers on real responses, or it can never call :11435.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .route("/api/{*rest}", post(|| async { "never reached in preflight" }))
+                .layer(middleware::from_fn(cors));
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let client = reqwest::Client::new();
+            let origin = "http://localhost:7146";
+
+            // 1) Preflight OPTIONS is answered here (204) WITHOUT routing, with the
+            //    Origin reflected, the requested headers echoed, and the
+            //    Private-Network-Access header Chrome needs for a localhost->127.0.0.1 call.
+            let pre = client
+                .request(reqwest::Method::OPTIONS, format!("http://127.0.0.1:{}/api/chat", addr.port()))
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "content-type")
+                .send()
+                .await
+                .expect("preflight request");
+            assert_eq!(pre.status().as_u16(), 204, "preflight must be 204 No Content");
+            let hz = pre.headers();
+            assert_eq!(hz.get("access-control-allow-origin").unwrap(), origin);
+            assert_eq!(hz.get("access-control-allow-private-network").unwrap(), "true");
+            assert!(hz.get("access-control-allow-methods").is_some());
+            assert_eq!(hz.get("access-control-allow-headers").unwrap(), "content-type");
+
+            // 2) A normal (non-preflight) response also carries the CORS headers.
+            let ok = client
+                .get(format!("http://127.0.0.1:{}/health", addr.port()))
+                .header("origin", origin)
+                .send()
+                .await
+                .expect("health request");
+            assert_eq!(ok.status().as_u16(), 200);
+            assert_eq!(
+                ok.headers().get("access-control-allow-origin").unwrap(),
+                origin,
+                "normal responses must carry Access-Control-Allow-Origin"
             );
         });
     }
