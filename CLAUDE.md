@@ -38,7 +38,7 @@ tina4 doctor                     Check installed languages/tools, ports, AND glo
                                  Tina4 AI-skills currency (~/.claude/skills vs the latest
                                  published ref). Strictly READ-ONLY: it reports + suggests a
                                  refresh; it writes nothing and NEVER touches a project CLAUDE.md.
-tina4 install <target>           Install a language runtime or tina4-js
+tina4 install <target>           Install a language runtime, tina4-js, or codeql (for tina4 codeql)
 tina4 generate <what> <name>     Generate model, route, migration, middleware
 tina4 migrate                    Run database migrations
 tina4 test                       Run tests
@@ -117,6 +117,26 @@ tina4 metrics                    Report code-health top offenders (complexity, l
                                  listed under `unparsed` in --json, counted as
                                  `files_refused` in the summary, and raised as a `warn`
                                  offender so --fail-on warn goes red on it.
+tina4 codeql                     Run CodeQL locally as a pre-check, matching CI's GitHub
+                                 "default setup (extended)" scan (the per-language
+                                 security-extended suite) over JS/TS, Ruby, Python and
+                                 GitHub Actions — so findings show BEFORE CI. Needs the
+                                 codeql CLI (`brew install codeql`, then
+                                 `codeql pack download codeql/javascript-queries
+                                 codeql/ruby-queries codeql/python-queries
+                                 codeql/actions-queries`). Auto-detects the project
+                                 language (+ actions when .github/workflows exists);
+                                 override with repeatable --language, skip workflows with
+                                 --no-actions, scan elsewhere with --path. Creates a
+                                 throwaway DB per language, analyses the security-extended
+                                 suite, prints findings grouped by rule id + file:line, and
+                                 EXITS WITH THE FINDING COUNT so it gates a pre-push hook:
+                                 `tina4 codeql || { echo "CodeQL findings"; exit 1; }`.
+                                 PHP is skipped (no CodeQL support; CI uses Semgrep). Faithful
+                                 to CI: it only flags source→sink taint flows, not a grep.
+                                 Cost is DB creation (actions/ruby/python seconds; a full
+                                 JS/TS monorepo a few minutes), so it is a pre-push / on-demand
+                                 check, not pre-commit.
 tina4 scss                       Compile SCSS files
 tina4 ai                         Detect AI tools and install context
 tina4 deploy <target> [--runtime R]
