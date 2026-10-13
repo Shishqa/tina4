@@ -38,7 +38,7 @@ tina4 doctor                     Check installed languages/tools, ports, AND glo
                                  Tina4 AI-skills currency (~/.claude/skills vs the latest
                                  published ref). Strictly READ-ONLY: it reports + suggests a
                                  refresh; it writes nothing and NEVER touches a project CLAUDE.md.
-tina4 install <target>           Install a language runtime or tina4-js
+tina4 install <target>           Install a language runtime, tina4-js, or codeql (for tina4 codeql)
 tina4 generate <what> <name>     Generate model, route, migration, middleware
 tina4 migrate                    Run database migrations
 tina4 test                       Run tests

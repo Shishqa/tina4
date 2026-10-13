@@ -33,6 +33,7 @@ pub fn run(lang: &str) {
         "ruby" | "rb" => install_ruby(),
         "nodejs" | "node" | "js" => install_nodejs(),
         "tina4-js" | "tina4js" | "js-frontend" => install_tina4_js(),
+        "codeql" => install_codeql(),
         "all" => {
             install_python();
             install_php();
@@ -41,7 +42,7 @@ pub fn run(lang: &str) {
         }
         _ => {
             eprintln!(
-                "{} Unknown target: {}. Use: python, php, ruby, nodejs, tina4-js, all",
+                "{} Unknown target: {}. Use: python, php, ruby, nodejs, tina4-js, codeql, all",
                 icon_fail().red(),
                 lang
             );
@@ -591,6 +592,41 @@ fn refresh_brew_path_macos() {
         }
     }
     std::env::set_var("PATH", parts.join(":"));
+}
+
+fn install_codeql() {
+    println!("\n{} Installing CodeQL (powers `tina4 codeql`)...", icon_play().green());
+
+    if check_exists("codeql") {
+        println!("  {} codeql already installed", icon_ok().green());
+    } else if console::is_windows() {
+        // CodeQL has no native Windows package that lands `codeql` on PATH, so
+        // we guide rather than guess: the gh extension or the official zip.
+        println!("  {} CodeQL has no native Windows package.", icon_warn().yellow());
+        println!("     Install the GitHub CLI, then: {}", "gh extensions install github/gh-codeql".cyan());
+        println!(
+            "     or download {} from {} and add it to PATH",
+            "codeql-win64.zip".cyan(),
+            "https://github.com/github/codeql-cli-binaries/releases".cyan()
+        );
+        return;
+    } else {
+        // macOS + Linux: Homebrew ships a codeql formula.
+        run_install_commands(&[("brew", &["install", "codeql"])]);
+    }
+
+    // The query packs the security-extended suite needs (idempotent re-download).
+    if check_exists("codeql") {
+        println!("  {} Downloading CodeQL query packs...", icon_play().green());
+        let _ = Command::new("codeql")
+            .args([
+                "pack", "download",
+                "codeql/javascript-queries", "codeql/ruby-queries",
+                "codeql/python-queries", "codeql/actions-queries",
+            ])
+            .status();
+        println!("  {} Pre-check a repo with: {}", icon_info().blue(), "tina4 codeql".cyan());
+    }
 }
 
 fn check_exists(cmd: &str) -> bool {

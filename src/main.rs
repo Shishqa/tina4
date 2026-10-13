@@ -75,9 +75,9 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Install a language runtime (python, php, ruby, nodejs)
+    /// Install a language runtime or tool (python, php, ruby, nodejs, tina4-js, codeql)
     Install {
-        /// Language to install: python, php, ruby, nodejs
+        /// Target to install: python, php, ruby, nodejs, tina4-js, codeql
         lang: String,
     },
 
