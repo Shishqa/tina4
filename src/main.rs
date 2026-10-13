@@ -7,6 +7,7 @@
 pub mod console;
 mod ai_gateway;
 mod auth;
+mod codeql;
 mod deploy;
 mod env_config;
 mod env_migrate;
@@ -74,9 +75,9 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Install a language runtime (python, php, ruby, nodejs)
+    /// Install a language runtime or tool (python, php, ruby, nodejs, tina4-js, codeql)
     Install {
-        /// Language to install: python, php, ruby, nodejs
+        /// Target to install: python, php, ruby, nodejs, tina4-js, codeql
         lang: String,
     },
 
@@ -274,6 +275,23 @@ enum Commands {
         fail_on_regression: bool,
     },
 
+    /// Run CodeQL locally as a pre-check before pushing, matching CI's GitHub
+    /// "default setup (extended)" scan (the per-language security-extended suite)
+    /// over JS/TS, Ruby, Python and GitHub Actions. Needs the codeql CLI
+    /// (`brew install codeql`, then `codeql pack download codeql/*-queries`).
+    /// Exit code is the finding count, so it gates a pre-push hook.
+    Codeql {
+        /// Source directory to scan (default: current directory)
+        #[arg(long)]
+        path: Option<String>,
+        /// Language to scan, repeatable (default: auto-detected + actions)
+        #[arg(long = "language", value_name = "javascript-typescript|python|ruby|actions")]
+        languages: Vec<String>,
+        /// Skip the GitHub Actions workflow scan
+        #[arg(long = "no-actions")]
+        no_actions: bool,
+    },
+
     /// Any command the client doesn't own is forwarded verbatim to the detected
     /// framework CLI: `tina4 <cmd> <args...>` -> `<framework-cli> <cmd> <args...>`.
     /// This covers migrate/migrate:create/seed/test/lint/routes/queue/
@@ -330,6 +348,8 @@ fn main() {
 
     match cli.command {
         Commands::Doctor => doctor::run(),
+
+        Commands::Codeql { path, languages, no_actions } => codeql::run(path, languages, no_actions),
 
         Commands::Setup { dry_run, skip_install, elevated, lang, ai, projects_dir, name } => {
             setup::run(setup::SetupArgs {
