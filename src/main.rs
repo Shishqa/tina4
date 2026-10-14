@@ -676,6 +676,37 @@ fn run_serve(args: ServeArgs) {
     // tab from the framework side.
     handle_serve(port, &host, dev, production, no_browser);
 }
+/// Resolve the port to serve on: an explicit `--port` wins; otherwise load `.env`
+/// (without overriding existing env vars) and take `TINA4_PORT`, then `PORT`, then
+/// the framework default. Split out of handle_serve to keep that function readable.
+fn resolve_requested_port(explicit: Option<u16>, default_port: u16) -> u16 {
+    if let Some(p) = explicit {
+        return p;
+    }
+    // Read .env file if it exists (don't override existing env vars)
+    if let Ok(contents) = std::fs::read_to_string(".env") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = env_config::unquote_env_value(value);
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
+    // Check TINA4_PORT first, then PORT, then framework default
+    std::env::var("TINA4_PORT")
+        .or_else(|_| std::env::var("PORT"))
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(default_port)
+}
+
 pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_production: bool, no_browser: bool) {
     // The CLI owns browser-opening (tina4: ADR-0070). Decide OUR answer here,
     // before any child is spawned, then suppress the child's unconditionally.
@@ -726,30 +757,7 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
     };
 
     // Port priority: CLI flag > TINA4_PORT env/dotenv > PORT env/dotenv > framework default
-    let requested_port = port.unwrap_or_else(|| {
-        // Read .env file if it exists (don't override existing env vars)
-        if let Ok(contents) = std::fs::read_to_string(".env") {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim();
-                    let value = env_config::unquote_env_value(value);
-                    if std::env::var(key).is_err() {
-                        std::env::set_var(key, value);
-                    }
-                }
-            }
-        }
-        // Check TINA4_PORT first, then PORT, then framework default
-        std::env::var("TINA4_PORT")
-            .or_else(|_| std::env::var("PORT"))
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or_else(|| info.default_port())
-    });
+    let requested_port = resolve_requested_port(port, info.default_port());
 
     // A busy port, whether from --port or the default, is taken over only from
     // this project's own Tina4 dev server. Anything else holding it is left
@@ -3172,6 +3180,15 @@ mod tests {
     // and no undo.
 
     use super::{classify_cli_generation, version_majors, CliGeneration};
+
+    #[test]
+    fn an_explicit_port_always_wins() {
+        // --port is the highest-priority source: it is returned verbatim,
+        // regardless of TINA4_PORT / PORT / .env or the framework default. This
+        // pins the invariant now that the resolution lives in its own function.
+        assert_eq!(super::resolve_requested_port(Some(9999), 7146), 9999);
+        assert_eq!(super::resolve_requested_port(Some(3000), 8080), 3000);
+    }
 
     // ---- self-update integrity: downgrade guard + checksum lookup ---------
     //
