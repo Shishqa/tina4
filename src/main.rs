@@ -2319,7 +2319,23 @@ fn update_framework_package() {
         pkg.cyan()
     );
 
-    let success = match lang {
+    let success = run_framework_update(lang);
+
+    if success {
+        println!("{} {} updated", icon_ok().green(), pkg.cyan());
+    } else {
+        eprintln!(
+            "{} Framework update failed. Check the output above for details.",
+            icon_warn().yellow(),
+        );
+    }
+}
+
+/// Run the per-language framework-package update command, returning true on
+/// success. Split out of update_framework_package so the prompt/report flow
+/// stays readable.
+fn run_framework_update(lang: &str) -> bool {
+    match lang {
         "python" => {
             // Python needs two steps: update lockfile then sync
             let lock_ok = std::process::Command::new("uv")
@@ -2364,15 +2380,6 @@ fn update_framework_package() {
             .map(|s| s.success())
             .unwrap_or(false),
         _ => false,
-    };
-
-    if success {
-        println!("{} {} updated", icon_ok().green(), pkg.cyan());
-    } else {
-        eprintln!(
-            "{} Framework update failed. Check the output above for details.",
-            icon_warn().yellow(),
-        );
     }
 }
 
