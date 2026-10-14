@@ -367,122 +367,8 @@ fn main() {
 
         Commands::Init { lang, path } => init::run(lang.as_deref(), path.as_deref()),
 
-        Commands::Serve { project, port, host, dev, production, no_browser, no_reload, no_kill } => {
-            // `tina4 serve <projectname>` — resolve the named project and
-            // change into it before serving. Look in the current folder
-            // first (./<name>), then the configured projects folder.
-            if let Some(name) = project {
-                let cwd_candidate = std::env::current_dir()
-                    .map(|d| d.join(&name))
-                    .ok()
-                    .filter(|p| p.is_dir());
-                let resolved = cwd_candidate.or_else(|| {
-                    crate::setup::configured_projects_dir()
-                        .map(|d| d.join(&name))
-                        .filter(|p| p.is_dir())
-                });
-                match resolved {
-                    Some(path) => {
-                        if let Err(e) = std::env::set_current_dir(&path) {
-                            eprintln!(
-                                "{} Could not enter {}: {}",
-                                icon_fail().red(),
-                                path.display(),
-                                e
-                            );
-                            std::process::exit(1);
-                        }
-                        println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
-                    }
-                    None => {
-                        let dir = crate::setup::configured_projects_dir()
-                            .map(|d| d.display().to_string())
-                            .unwrap_or_else(|| "(none configured)".to_string());
-                        eprintln!(
-                            "{} Project '{}' not found in the current folder or your projects folder ({})",
-                            icon_fail().red(),
-                            name,
-                            dir
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            } else if detect::detect_language().is_none() {
-                // Bare `tina4 serve` and the current folder is NOT a Tina4
-                // project. Fall back to the configured projects folder: if it
-                // holds exactly one project, cd into it and serve; if several,
-                // list them and ask the user to name one; if none, guide them.
-                if let Some(projects_dir) = crate::setup::configured_projects_dir() {
-                    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&projects_dir)
-                        .map(|rd| {
-                            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                                .filter(|p| p.is_dir() && detect::dir_is_tina4_project(p))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    found.sort();
-                    match found.len() {
-                        1 => {
-                            let path = &found[0];
-                            if let Err(e) = std::env::set_current_dir(path) {
-                                eprintln!("{} Could not enter {}: {}", icon_fail().red(), path.display(), e);
-                                std::process::exit(1);
-                            }
-                            println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
-                        }
-                        0 => {
-                            eprintln!(
-                                "{} Not in a Tina4 project, and no projects found in {}.",
-                                icon_fail().red(),
-                                projects_dir.display()
-                            );
-                            eprintln!("  Run {} to scaffold one, or cd into a project first.", "tina4 setup".cyan());
-                            std::process::exit(1);
-                        }
-                        _ => {
-                            eprintln!(
-                                "{} Not in a Tina4 project. Projects in {}:",
-                                icon_info().blue(),
-                                projects_dir.display()
-                            );
-                            for p in &found {
-                                if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
-                                    eprintln!("    {}", n.cyan());
-                                }
-                            }
-                            eprintln!("  Run {} to serve one.", "tina4 serve <name>".cyan());
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "{} Not in a Tina4 project (no app.py / index.php / app.rb / app.ts here).",
-                        icon_fail().red()
-                    );
-                    eprintln!("  cd into a project, or run {} first.", "tina4 setup".cyan());
-                    std::process::exit(1);
-                }
-            }
-            // --no-reload is the flag form of TINA4_NO_RELOAD=true.
-            // Set it in the environment before handing off to the
-            // server bootstrap so the watcher and language CLI both
-            // see it.
-            if no_reload {
-                std::env::set_var("TINA4_NO_RELOAD", "true");
-            }
-            // --no-kill is the flag form of TINA4_NO_TAKEOVER=true. Set it in
-            // the environment so the CLI's own takeover gate and the framework's
-            // runtime bind-failure path both read the same opt-out.
-            if no_kill {
-                std::env::set_var("TINA4_NO_TAKEOVER", "true");
-            }
-            // TINA4_NO_BROWSER is now set for the child unconditionally inside
-            // handle_serve — the CLI opens the browser, the framework must not.
-            // The conditional set that used to live here only covered the
-            // --no-browser case, which left a plain `serve` opening a duplicate
-            // tab from the framework side.
-            handle_serve(port, &host, dev, production, no_browser);
-        }
+        Commands::Serve { project, port, host, dev, production, no_browser, no_reload, no_kill } =>
+            run_serve(ServeArgs { project, port, host, dev, production, no_browser, no_reload, no_kill }),
 
         Commands::Scss {
             input,
@@ -656,6 +542,140 @@ fn production_env() -> [(&'static str, &'static str); 2] {
     ]
 }
 
+
+/// Resolve the project to serve (a named project, or the current folder, or
+/// the configured projects folder) and hand off to [`handle_serve`]. Extracted
+/// from `main`'s Serve arm so the dispatch stays a thin match.
+/// Arguments for run_serve, grouped like setup's SetupArgs so the single
+/// dispatch call stays within clippy's argument-count limit.
+struct ServeArgs {
+    project: Option<String>,
+    port: Option<u16>,
+    host: String,
+    dev: bool,
+    production: bool,
+    no_browser: bool,
+    no_reload: bool,
+    no_kill: bool,
+}
+
+fn run_serve(args: ServeArgs) {
+    let ServeArgs { project, port, host, dev, production, no_browser, no_reload, no_kill } = args;
+    // `tina4 serve <projectname>` — resolve the named project and
+    // change into it before serving. Look in the current folder
+    // first (./<name>), then the configured projects folder.
+    if let Some(name) = project {
+        let cwd_candidate = std::env::current_dir()
+            .map(|d| d.join(&name))
+            .ok()
+            .filter(|p| p.is_dir());
+        let resolved = cwd_candidate.or_else(|| {
+            crate::setup::configured_projects_dir()
+                .map(|d| d.join(&name))
+                .filter(|p| p.is_dir())
+        });
+        match resolved {
+            Some(path) => {
+                if let Err(e) = std::env::set_current_dir(&path) {
+                    eprintln!(
+                        "{} Could not enter {}: {}",
+                        icon_fail().red(),
+                        path.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
+            }
+            None => {
+                let dir = crate::setup::configured_projects_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "(none configured)".to_string());
+                eprintln!(
+                    "{} Project '{}' not found in the current folder or your projects folder ({})",
+                    icon_fail().red(),
+                    name,
+                    dir
+                );
+                std::process::exit(1);
+            }
+        }
+    } else if detect::detect_language().is_none() {
+        // Bare `tina4 serve` and the current folder is NOT a Tina4
+        // project. Fall back to the configured projects folder: if it
+        // holds exactly one project, cd into it and serve; if several,
+        // list them and ask the user to name one; if none, guide them.
+        if let Some(projects_dir) = crate::setup::configured_projects_dir() {
+            let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&projects_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| p.is_dir() && detect::dir_is_tina4_project(p))
+                        .collect()
+                })
+                .unwrap_or_default();
+            found.sort();
+            match found.len() {
+                1 => {
+                    let path = &found[0];
+                    if let Err(e) = std::env::set_current_dir(path) {
+                        eprintln!("{} Could not enter {}: {}", icon_fail().red(), path.display(), e);
+                        std::process::exit(1);
+                    }
+                    println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
+                }
+                0 => {
+                    eprintln!(
+                        "{} Not in a Tina4 project, and no projects found in {}.",
+                        icon_fail().red(),
+                        projects_dir.display()
+                    );
+                    eprintln!("  Run {} to scaffold one, or cd into a project first.", "tina4 setup".cyan());
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!(
+                        "{} Not in a Tina4 project. Projects in {}:",
+                        icon_info().blue(),
+                        projects_dir.display()
+                    );
+                    for p in &found {
+                        if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
+                            eprintln!("    {}", n.cyan());
+                        }
+                    }
+                    eprintln!("  Run {} to serve one.", "tina4 serve <name>".cyan());
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!(
+                "{} Not in a Tina4 project (no app.py / index.php / app.rb / app.ts here).",
+                icon_fail().red()
+            );
+            eprintln!("  cd into a project, or run {} first.", "tina4 setup".cyan());
+            std::process::exit(1);
+        }
+    }
+    // --no-reload is the flag form of TINA4_NO_RELOAD=true.
+    // Set it in the environment before handing off to the
+    // server bootstrap so the watcher and language CLI both
+    // see it.
+    if no_reload {
+        std::env::set_var("TINA4_NO_RELOAD", "true");
+    }
+    // --no-kill is the flag form of TINA4_NO_TAKEOVER=true. Set it in
+    // the environment so the CLI's own takeover gate and the framework's
+    // runtime bind-failure path both read the same opt-out.
+    if no_kill {
+        std::env::set_var("TINA4_NO_TAKEOVER", "true");
+    }
+    // TINA4_NO_BROWSER is now set for the child unconditionally inside
+    // handle_serve — the CLI opens the browser, the framework must not.
+    // The conditional set that used to live here only covered the
+    // --no-browser case, which left a plain `serve` opening a duplicate
+    // tab from the framework side.
+    handle_serve(port, &host, dev, production, no_browser);
+}
 pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_production: bool, no_browser: bool) {
     // The CLI owns browser-opening (tina4: ADR-0070). Decide OUR answer here,
     // before any child is spawned, then suppress the child's unconditionally.
