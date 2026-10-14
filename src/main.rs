@@ -763,10 +763,18 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
     }
     let port = requested_port;
 
+    // A manifest that declares a version (pyproject/composer/package.json) shows
+    // it after the language; projects without one read exactly as before.
+    let version_suffix = info
+        .version
+        .as_deref()
+        .map(|v| format!(" (v{})", v))
+        .unwrap_or_default();
     println!(
-        "{} Detected {} project",
+        "{} Detected {} project{}",
         icon_ok().green(),
-        info.language.cyan()
+        info.language.cyan(),
+        version_suffix.dimmed()
     );
 
     // Set TINA4_DEBUG=true when --dev flag is used, so the framework

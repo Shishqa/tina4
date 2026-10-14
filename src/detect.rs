@@ -10,7 +10,9 @@ use std::path::Path;
 #[derive(Clone)]
 pub struct ProjectInfo {
     pub language: String,
-    #[allow(dead_code)]
+    /// The project's declared version from its manifest (pyproject `version`,
+    /// or the top-level `version` in composer.json / package.json), when present.
+    /// Shown by `tina4 serve` and `tina4 doctor`.
     pub version: Option<String>,
 }
 
