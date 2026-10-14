@@ -368,7 +368,7 @@ fn main() {
         Commands::Init { lang, path } => init::run(lang.as_deref(), path.as_deref()),
 
         Commands::Serve { project, port, host, dev, production, no_browser, no_reload, no_kill } =>
-            run_serve(project, port, &host, dev, production, no_browser, no_reload, no_kill),
+            run_serve(ServeArgs { project, port, host, dev, production, no_browser, no_reload, no_kill }),
 
         Commands::Scss {
             input,
@@ -546,16 +546,21 @@ fn production_env() -> [(&'static str, &'static str); 2] {
 /// Resolve the project to serve (a named project, or the current folder, or
 /// the configured projects folder) and hand off to [`handle_serve`]. Extracted
 /// from `main`'s Serve arm so the dispatch stays a thin match.
-fn run_serve(
+/// Arguments for run_serve, grouped like setup's SetupArgs so the single
+/// dispatch call stays within clippy's argument-count limit.
+struct ServeArgs {
     project: Option<String>,
     port: Option<u16>,
-    host: &str,
+    host: String,
     dev: bool,
     production: bool,
     no_browser: bool,
     no_reload: bool,
     no_kill: bool,
-) {
+}
+
+fn run_serve(args: ServeArgs) {
+    let ServeArgs { project, port, host, dev, production, no_browser, no_reload, no_kill } = args;
     // `tina4 serve <projectname>` — resolve the named project and
     // change into it before serving. Look in the current folder
     // first (./<name>), then the configured projects folder.
@@ -669,7 +674,7 @@ fn run_serve(
     // The conditional set that used to live here only covered the
     // --no-browser case, which left a plain `serve` opening a duplicate
     // tab from the framework side.
-    handle_serve(port, host, dev, production, no_browser);
+    handle_serve(port, &host, dev, production, no_browser);
 }
 pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_production: bool, no_browser: bool) {
     // The CLI owns browser-opening (tina4: ADR-0070). Decide OUR answer here,
