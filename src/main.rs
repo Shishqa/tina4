@@ -870,19 +870,13 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
     // changes do NOT respawn it: the watcher POSTs /__dev/api/reload and
     // the framework re-imports changed modules in-process (see
     // watcher.rs), so the server stays up and dashboard/WebSocket
-    // connections survive. This loop's job is supervision -- detect when
-    // the child exits on its own (a crash) and surface the error.
-    //
-    // The respawn_requested flag below is retained as dormant
-    // infrastructure: the watcher no longer sets it, so the respawn
-    // branch never fires today. It is kept (cheaply) for a future
-    // crash-recovery path, and the group-kill it performs matches the
-    // shutdown handler so it can never orphan the child tree if revived.
+    // connections survive. The CLI's only job here is supervision --
+    // block until the child exits on its own and surface the status --
+    // plus clean shutdown of the whole child tree on a signal (below).
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
 
     let mut current_child = initial_child;
-    let respawn_requested = Arc::new(AtomicBool::new(false));
 
     // Track the current child's pid (== its process-group id, set via setpgid)
     // so the shutdown handler can tear down the WHOLE dev-server tree (npx -> tsx
@@ -969,71 +963,23 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
         // code-file changes. Main polls the flag below. (dev only)
         if info.language != "tina4js" {
             let reload_port = port;
-            let watcher_flag = Arc::clone(&respawn_requested);
             std::thread::spawn(move || {
-                watcher::watch_and_reload(reload_port, Some(watcher_flag));
+                watcher::watch_and_reload(reload_port);
             });
         }
     }
 
     // ── Respawn loop ───────────────────────────────────────────────
-    // Polls the current child every 250ms with try_wait() AND checks
-    // the respawn_requested flag. If the flag is set, kill the child
-    // we own and spin up a fresh one. If the child exits naturally
-    // (non-zero), surface the error and bail.
-    let info_clone = info.clone();
-    let host_clone = host.to_string();
+    // Supervision: the CLI owns the child dev server and blocks here until it
+    // exits. File changes hot-reload in-process (the watcher POSTs
+    // /__dev/api/reload — see watcher.rs), so there is nothing to respawn; this
+    // loop only detects the child exiting on its own and surfaces the status.
+    // Clean shutdown on Ctrl-C / SIGTERM / SIGHUP is the ctrlc handler above,
+    // which group-kills the whole child tree via current_pid.
     loop {
-        // Inner poll loop — exits when either:
-        //   (a) child exited naturally (status returned by try_wait)
-        //   (b) watcher set respawn_requested → we kill + break
-        let exit_cause: ExitCause = loop {
-            // Dormant respawn branch (the watcher no longer sets this flag --
-            // see the supervision note above). If ever revived, it kills the
-            // child's whole process GROUP before respawning: Child::kill would
-            // signal only the direct PID (npx), orphaning the tsx -> node
-            // grandchildren. terminate_group reaps the entire tree.
-            if respawn_requested.swap(false, Ordering::SeqCst) {
-                terminate_group(current_child.id());
-                let _ = current_child.wait(); // reap the direct child
-                current_pid.store(0, Ordering::SeqCst);
-                break ExitCause::Respawn;
-            }
-            // Child exited on its own?
-            match current_child.try_wait() {
-                Ok(Some(status)) => break ExitCause::Exited(status),
-                Ok(None) => { /* still running */ }
-                Err(e) => break ExitCause::WaitError(e),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        };
-
-        match exit_cause {
-            ExitCause::Respawn => {
-                println!("{} Respawning {} after code change…",
-                    icon_play().green(), info_clone.cli_name().cyan());
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                match start_language_server(&info_clone, port, &host_clone) {
-                    Some(new_child) => {
-                        current_child = new_child;
-                        current_pid.store(current_child.id() as i32, Ordering::SeqCst);
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        let body = r#"{"type":"reload","file":"<respawn>"}"#;
-                        let url = format!("http://127.0.0.1:{}/__dev/api/reload", port);
-                        let _ = watcher::ureq_post(&url, body);
-                        println!("{} Server ready: {}", icon_ok().green(),
-                            format!("http://localhost:{}", port).cyan());
-                        // Loop back — keep polling the new child
-                    }
-                    None => {
-                        eprintln!("{} Respawn failed — child wouldn't start. Fix the error and re-run.",
-                            icon_fail().red());
-                        std::process::exit(1);
-                    }
-                }
-            }
-            ExitCause::Exited(status) if status.success() => break,
-            ExitCause::Exited(status) => {
+        match current_child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
                 let code = status.code().unwrap_or(-1);
                 eprintln!(
                     "\n{} Server process exited with code {}. Check logs/error.log or your PHP/Python error log for details.",
@@ -1042,7 +988,8 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
                 );
                 std::process::exit(code);
             }
-            ExitCause::WaitError(e) => {
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(e) => {
                 eprintln!("\n{} Server process error: {}", icon_fail().red(), e);
                 std::process::exit(1);
             }
@@ -1104,12 +1051,6 @@ fn take_over_port_or_exit(port: u16, dev: bool, no_takeover: bool) {
 
 fn join_pids(pids: &[u32]) -> String {
     pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-}
-
-enum ExitCause {
-    Respawn,
-    Exited(std::process::ExitStatus),
-    WaitError(std::io::Error),
 }
 
 /// Read a variable's raw value from the given `.env` file, surrounding quotes
