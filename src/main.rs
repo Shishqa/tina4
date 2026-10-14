@@ -707,6 +707,49 @@ fn resolve_requested_port(explicit: Option<u16>, default_port: u16) -> u16 {
         .unwrap_or(default_port)
 }
 
+
+/// Apply the --dev / --production flags before the server starts: force
+/// TINA4_DEBUG on for --dev, or set the production env and install the best
+/// production server for --production. Extracted from handle_serve.
+fn apply_serve_mode_flags(force_dev: bool, force_production: bool, info: &detect::ProjectInfo) {
+    // Set TINA4_DEBUG=true when --dev flag is used, so the framework
+    // CLI forces the dev server even if a production server is installed
+    if force_dev {
+        std::env::set_var("TINA4_DEBUG", "true");
+        println!(
+            "{} Dev mode forced — production server detection disabled",
+            icon_info().blue()
+        );
+    }
+
+    // --production: install best production server if not available, force debug off
+    if force_production {
+        for (key, value) in production_env() {
+            std::env::set_var(key, value);
+        }
+        // TINA4_PRODUCTION is how a framework knows the CLI meant production,
+        // as opposed to merely inferring it from TINA4_DEBUG being false (which
+        // is also true for a plain `tina4 serve` on a project that sets it).
+        //
+        // Node reads it to decide whether to fork a worker per CPU core. Nothing
+        // set it, so `tina4 serve --production` ran ONE process on ONE core, and
+        // the cluster path was unreachable from the CLI - which is also why its
+        // never-worked bug went unnoticed for so long. Measured before this
+        // line existed: `--production` printed a plain banner; only
+        // `TINA4_PRODUCTION=true tina4 serve --production` printed
+        // "(cluster, 8 workers)".
+        //
+        // Python, PHP and Ruby do not read it, so this is a no-op for them
+        // today. It is set unconditionally rather than per-language so the
+        // meaning stays "the operator asked for production", not "Node needs a
+        // flag" - the next framework to want the distinction gets it free.
+        println!(
+            "{} Production mode — installing best server if needed",
+            icon_play().green()
+        );
+        install_production_server(info);
+    }
+}
 pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_production: bool, no_browser: bool) {
     // The CLI owns browser-opening (tina4: ADR-0070). Decide OUR answer here,
     // before any child is spawned, then suppress the child's unconditionally.
@@ -785,43 +828,7 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
         version_suffix.dimmed()
     );
 
-    // Set TINA4_DEBUG=true when --dev flag is used, so the framework
-    // CLI forces the dev server even if a production server is installed
-    if force_dev {
-        std::env::set_var("TINA4_DEBUG", "true");
-        println!(
-            "{} Dev mode forced — production server detection disabled",
-            icon_info().blue()
-        );
-    }
-
-    // --production: install best production server if not available, force debug off
-    if force_production {
-        for (key, value) in production_env() {
-            std::env::set_var(key, value);
-        }
-        // TINA4_PRODUCTION is how a framework knows the CLI meant production,
-        // as opposed to merely inferring it from TINA4_DEBUG being false (which
-        // is also true for a plain `tina4 serve` on a project that sets it).
-        //
-        // Node reads it to decide whether to fork a worker per CPU core. Nothing
-        // set it, so `tina4 serve --production` ran ONE process on ONE core, and
-        // the cluster path was unreachable from the CLI - which is also why its
-        // never-worked bug went unnoticed for so long. Measured before this
-        // line existed: `--production` printed a plain banner; only
-        // `TINA4_PRODUCTION=true tina4 serve --production` printed
-        // "(cluster, 8 workers)".
-        //
-        // Python, PHP and Ruby do not read it, so this is a no-op for them
-        // today. It is set unconditionally rather than per-language so the
-        // meaning stays "the operator asked for production", not "Node needs a
-        // flag" - the next framework to want the distinction gets it free.
-        println!(
-            "{} Production mode — installing best server if needed",
-            icon_play().green()
-        );
-        install_production_server(&info);
-    }
+    apply_serve_mode_flags(force_dev, force_production, &info);
 
     // Compile SCSS
     let scss_dir = "src/scss";
