@@ -269,10 +269,16 @@ pub fn run() {
     println!();
     match crate::detect::detect_language() {
         Some(info) => {
+            let version_suffix = info
+                .version
+                .as_deref()
+                .map(|v| format!(" (v{})", v))
+                .unwrap_or_default();
             println!(
-                "  {} Current directory: {} project",
+                "  {} Current directory: {} project{}",
                 icon_play().green(),
-                info.language.cyan()
+                info.language.cyan(),
+                version_suffix.dimmed()
             );
         }
         None => {

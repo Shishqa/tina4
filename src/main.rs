@@ -367,122 +367,8 @@ fn main() {
 
         Commands::Init { lang, path } => init::run(lang.as_deref(), path.as_deref()),
 
-        Commands::Serve { project, port, host, dev, production, no_browser, no_reload, no_kill } => {
-            // `tina4 serve <projectname>` — resolve the named project and
-            // change into it before serving. Look in the current folder
-            // first (./<name>), then the configured projects folder.
-            if let Some(name) = project {
-                let cwd_candidate = std::env::current_dir()
-                    .map(|d| d.join(&name))
-                    .ok()
-                    .filter(|p| p.is_dir());
-                let resolved = cwd_candidate.or_else(|| {
-                    crate::setup::configured_projects_dir()
-                        .map(|d| d.join(&name))
-                        .filter(|p| p.is_dir())
-                });
-                match resolved {
-                    Some(path) => {
-                        if let Err(e) = std::env::set_current_dir(&path) {
-                            eprintln!(
-                                "{} Could not enter {}: {}",
-                                icon_fail().red(),
-                                path.display(),
-                                e
-                            );
-                            std::process::exit(1);
-                        }
-                        println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
-                    }
-                    None => {
-                        let dir = crate::setup::configured_projects_dir()
-                            .map(|d| d.display().to_string())
-                            .unwrap_or_else(|| "(none configured)".to_string());
-                        eprintln!(
-                            "{} Project '{}' not found in the current folder or your projects folder ({})",
-                            icon_fail().red(),
-                            name,
-                            dir
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            } else if detect::detect_language().is_none() {
-                // Bare `tina4 serve` and the current folder is NOT a Tina4
-                // project. Fall back to the configured projects folder: if it
-                // holds exactly one project, cd into it and serve; if several,
-                // list them and ask the user to name one; if none, guide them.
-                if let Some(projects_dir) = crate::setup::configured_projects_dir() {
-                    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&projects_dir)
-                        .map(|rd| {
-                            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                                .filter(|p| p.is_dir() && detect::dir_is_tina4_project(p))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    found.sort();
-                    match found.len() {
-                        1 => {
-                            let path = &found[0];
-                            if let Err(e) = std::env::set_current_dir(path) {
-                                eprintln!("{} Could not enter {}: {}", icon_fail().red(), path.display(), e);
-                                std::process::exit(1);
-                            }
-                            println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
-                        }
-                        0 => {
-                            eprintln!(
-                                "{} Not in a Tina4 project, and no projects found in {}.",
-                                icon_fail().red(),
-                                projects_dir.display()
-                            );
-                            eprintln!("  Run {} to scaffold one, or cd into a project first.", "tina4 setup".cyan());
-                            std::process::exit(1);
-                        }
-                        _ => {
-                            eprintln!(
-                                "{} Not in a Tina4 project. Projects in {}:",
-                                icon_info().blue(),
-                                projects_dir.display()
-                            );
-                            for p in &found {
-                                if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
-                                    eprintln!("    {}", n.cyan());
-                                }
-                            }
-                            eprintln!("  Run {} to serve one.", "tina4 serve <name>".cyan());
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "{} Not in a Tina4 project (no app.py / index.php / app.rb / app.ts here).",
-                        icon_fail().red()
-                    );
-                    eprintln!("  cd into a project, or run {} first.", "tina4 setup".cyan());
-                    std::process::exit(1);
-                }
-            }
-            // --no-reload is the flag form of TINA4_NO_RELOAD=true.
-            // Set it in the environment before handing off to the
-            // server bootstrap so the watcher and language CLI both
-            // see it.
-            if no_reload {
-                std::env::set_var("TINA4_NO_RELOAD", "true");
-            }
-            // --no-kill is the flag form of TINA4_NO_TAKEOVER=true. Set it in
-            // the environment so the CLI's own takeover gate and the framework's
-            // runtime bind-failure path both read the same opt-out.
-            if no_kill {
-                std::env::set_var("TINA4_NO_TAKEOVER", "true");
-            }
-            // TINA4_NO_BROWSER is now set for the child unconditionally inside
-            // handle_serve — the CLI opens the browser, the framework must not.
-            // The conditional set that used to live here only covered the
-            // --no-browser case, which left a plain `serve` opening a duplicate
-            // tab from the framework side.
-            handle_serve(port, &host, dev, production, no_browser);
-        }
+        Commands::Serve { project, port, host, dev, production, no_browser, no_reload, no_kill } =>
+            run_serve(ServeArgs { project, port, host, dev, production, no_browser, no_reload, no_kill }),
 
         Commands::Scss {
             input,
@@ -656,6 +542,214 @@ fn production_env() -> [(&'static str, &'static str); 2] {
     ]
 }
 
+
+/// Resolve the project to serve (a named project, or the current folder, or
+/// the configured projects folder) and hand off to [`handle_serve`]. Extracted
+/// from `main`'s Serve arm so the dispatch stays a thin match.
+/// Arguments for run_serve, grouped like setup's SetupArgs so the single
+/// dispatch call stays within clippy's argument-count limit.
+struct ServeArgs {
+    project: Option<String>,
+    port: Option<u16>,
+    host: String,
+    dev: bool,
+    production: bool,
+    no_browser: bool,
+    no_reload: bool,
+    no_kill: bool,
+}
+
+fn run_serve(args: ServeArgs) {
+    let ServeArgs { project, port, host, dev, production, no_browser, no_reload, no_kill } = args;
+    // `tina4 serve <projectname>` — resolve the named project and
+    // change into it before serving. Look in the current folder
+    // first (./<name>), then the configured projects folder.
+    if let Some(name) = project {
+        let cwd_candidate = std::env::current_dir()
+            .map(|d| d.join(&name))
+            .ok()
+            .filter(|p| p.is_dir());
+        let resolved = cwd_candidate.or_else(|| {
+            crate::setup::configured_projects_dir()
+                .map(|d| d.join(&name))
+                .filter(|p| p.is_dir())
+        });
+        match resolved {
+            Some(path) => {
+                if let Err(e) = std::env::set_current_dir(&path) {
+                    eprintln!(
+                        "{} Could not enter {}: {}",
+                        icon_fail().red(),
+                        path.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
+            }
+            None => {
+                let dir = crate::setup::configured_projects_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "(none configured)".to_string());
+                eprintln!(
+                    "{} Project '{}' not found in the current folder or your projects folder ({})",
+                    icon_fail().red(),
+                    name,
+                    dir
+                );
+                std::process::exit(1);
+            }
+        }
+    } else if detect::detect_language().is_none() {
+        // Bare `tina4 serve` and the current folder is NOT a Tina4
+        // project. Fall back to the configured projects folder: if it
+        // holds exactly one project, cd into it and serve; if several,
+        // list them and ask the user to name one; if none, guide them.
+        if let Some(projects_dir) = crate::setup::configured_projects_dir() {
+            let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&projects_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| p.is_dir() && detect::dir_is_tina4_project(p))
+                        .collect()
+                })
+                .unwrap_or_default();
+            found.sort();
+            match found.len() {
+                1 => {
+                    let path = &found[0];
+                    if let Err(e) = std::env::set_current_dir(path) {
+                        eprintln!("{} Could not enter {}: {}", icon_fail().red(), path.display(), e);
+                        std::process::exit(1);
+                    }
+                    println!("{} Serving {}", icon_play().green(), path.display().to_string().cyan());
+                }
+                0 => {
+                    eprintln!(
+                        "{} Not in a Tina4 project, and no projects found in {}.",
+                        icon_fail().red(),
+                        projects_dir.display()
+                    );
+                    eprintln!("  Run {} to scaffold one, or cd into a project first.", "tina4 setup".cyan());
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!(
+                        "{} Not in a Tina4 project. Projects in {}:",
+                        icon_info().blue(),
+                        projects_dir.display()
+                    );
+                    for p in &found {
+                        if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
+                            eprintln!("    {}", n.cyan());
+                        }
+                    }
+                    eprintln!("  Run {} to serve one.", "tina4 serve <name>".cyan());
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!(
+                "{} Not in a Tina4 project (no app.py / index.php / app.rb / app.ts here).",
+                icon_fail().red()
+            );
+            eprintln!("  cd into a project, or run {} first.", "tina4 setup".cyan());
+            std::process::exit(1);
+        }
+    }
+    // --no-reload is the flag form of TINA4_NO_RELOAD=true.
+    // Set it in the environment before handing off to the
+    // server bootstrap so the watcher and language CLI both
+    // see it.
+    if no_reload {
+        std::env::set_var("TINA4_NO_RELOAD", "true");
+    }
+    // --no-kill is the flag form of TINA4_NO_TAKEOVER=true. Set it in
+    // the environment so the CLI's own takeover gate and the framework's
+    // runtime bind-failure path both read the same opt-out.
+    if no_kill {
+        std::env::set_var("TINA4_NO_TAKEOVER", "true");
+    }
+    // TINA4_NO_BROWSER is now set for the child unconditionally inside
+    // handle_serve — the CLI opens the browser, the framework must not.
+    // The conditional set that used to live here only covered the
+    // --no-browser case, which left a plain `serve` opening a duplicate
+    // tab from the framework side.
+    handle_serve(port, &host, dev, production, no_browser);
+}
+/// Resolve the port to serve on: an explicit `--port` wins; otherwise load `.env`
+/// (without overriding existing env vars) and take `TINA4_PORT`, then `PORT`, then
+/// the framework default. Split out of handle_serve to keep that function readable.
+fn resolve_requested_port(explicit: Option<u16>, default_port: u16) -> u16 {
+    if let Some(p) = explicit {
+        return p;
+    }
+    // Read .env file if it exists (don't override existing env vars)
+    if let Ok(contents) = std::fs::read_to_string(".env") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = env_config::unquote_env_value(value);
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
+    // Check TINA4_PORT first, then PORT, then framework default
+    std::env::var("TINA4_PORT")
+        .or_else(|_| std::env::var("PORT"))
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(default_port)
+}
+
+
+/// Apply the --dev / --production flags before the server starts: force
+/// TINA4_DEBUG on for --dev, or set the production env and install the best
+/// production server for --production. Extracted from handle_serve.
+fn apply_serve_mode_flags(force_dev: bool, force_production: bool, info: &detect::ProjectInfo) {
+    // Set TINA4_DEBUG=true when --dev flag is used, so the framework
+    // CLI forces the dev server even if a production server is installed
+    if force_dev {
+        std::env::set_var("TINA4_DEBUG", "true");
+        println!(
+            "{} Dev mode forced — production server detection disabled",
+            icon_info().blue()
+        );
+    }
+
+    // --production: install best production server if not available, force debug off
+    if force_production {
+        for (key, value) in production_env() {
+            std::env::set_var(key, value);
+        }
+        // TINA4_PRODUCTION is how a framework knows the CLI meant production,
+        // as opposed to merely inferring it from TINA4_DEBUG being false (which
+        // is also true for a plain `tina4 serve` on a project that sets it).
+        //
+        // Node reads it to decide whether to fork a worker per CPU core. Nothing
+        // set it, so `tina4 serve --production` ran ONE process on ONE core, and
+        // the cluster path was unreachable from the CLI - which is also why its
+        // never-worked bug went unnoticed for so long. Measured before this
+        // line existed: `--production` printed a plain banner; only
+        // `TINA4_PRODUCTION=true tina4 serve --production` printed
+        // "(cluster, 8 workers)".
+        //
+        // Python, PHP and Ruby do not read it, so this is a no-op for them
+        // today. It is set unconditionally rather than per-language so the
+        // meaning stays "the operator asked for production", not "Node needs a
+        // flag" - the next framework to want the distinction gets it free.
+        println!(
+            "{} Production mode — installing best server if needed",
+            icon_play().green()
+        );
+        install_production_server(info);
+    }
+}
 pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_production: bool, no_browser: bool) {
     // The CLI owns browser-opening (tina4: ADR-0070). Decide OUR answer here,
     // before any child is spawned, then suppress the child's unconditionally.
@@ -706,30 +800,7 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
     };
 
     // Port priority: CLI flag > TINA4_PORT env/dotenv > PORT env/dotenv > framework default
-    let requested_port = port.unwrap_or_else(|| {
-        // Read .env file if it exists (don't override existing env vars)
-        if let Ok(contents) = std::fs::read_to_string(".env") {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim();
-                    let value = env_config::unquote_env_value(value);
-                    if std::env::var(key).is_err() {
-                        std::env::set_var(key, value);
-                    }
-                }
-            }
-        }
-        // Check TINA4_PORT first, then PORT, then framework default
-        std::env::var("TINA4_PORT")
-            .or_else(|_| std::env::var("PORT"))
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or_else(|| info.default_port())
-    });
+    let requested_port = resolve_requested_port(port, info.default_port());
 
     // A busy port, whether from --port or the default, is taken over only from
     // this project's own Tina4 dev server. Anything else holding it is left
@@ -743,49 +814,21 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
     }
     let port = requested_port;
 
+    // A manifest that declares a version (pyproject/composer/package.json) shows
+    // it after the language; projects without one read exactly as before.
+    let version_suffix = info
+        .version
+        .as_deref()
+        .map(|v| format!(" (v{})", v))
+        .unwrap_or_default();
     println!(
-        "{} Detected {} project",
+        "{} Detected {} project{}",
         icon_ok().green(),
-        info.language.cyan()
+        info.language.cyan(),
+        version_suffix.dimmed()
     );
 
-    // Set TINA4_DEBUG=true when --dev flag is used, so the framework
-    // CLI forces the dev server even if a production server is installed
-    if force_dev {
-        std::env::set_var("TINA4_DEBUG", "true");
-        println!(
-            "{} Dev mode forced — production server detection disabled",
-            icon_info().blue()
-        );
-    }
-
-    // --production: install best production server if not available, force debug off
-    if force_production {
-        for (key, value) in production_env() {
-            std::env::set_var(key, value);
-        }
-        // TINA4_PRODUCTION is how a framework knows the CLI meant production,
-        // as opposed to merely inferring it from TINA4_DEBUG being false (which
-        // is also true for a plain `tina4 serve` on a project that sets it).
-        //
-        // Node reads it to decide whether to fork a worker per CPU core. Nothing
-        // set it, so `tina4 serve --production` ran ONE process on ONE core, and
-        // the cluster path was unreachable from the CLI - which is also why its
-        // never-worked bug went unnoticed for so long. Measured before this
-        // line existed: `--production` printed a plain banner; only
-        // `TINA4_PRODUCTION=true tina4 serve --production` printed
-        // "(cluster, 8 workers)".
-        //
-        // Python, PHP and Ruby do not read it, so this is a no-op for them
-        // today. It is set unconditionally rather than per-language so the
-        // meaning stays "the operator asked for production", not "Node needs a
-        // flag" - the next framework to want the distinction gets it free.
-        println!(
-            "{} Production mode — installing best server if needed",
-            icon_play().green()
-        );
-        install_production_server(&info);
-    }
+    apply_serve_mode_flags(force_dev, force_production, &info);
 
     // Compile SCSS
     let scss_dir = "src/scss";
@@ -827,19 +870,13 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
     // changes do NOT respawn it: the watcher POSTs /__dev/api/reload and
     // the framework re-imports changed modules in-process (see
     // watcher.rs), so the server stays up and dashboard/WebSocket
-    // connections survive. This loop's job is supervision -- detect when
-    // the child exits on its own (a crash) and surface the error.
-    //
-    // The respawn_requested flag below is retained as dormant
-    // infrastructure: the watcher no longer sets it, so the respawn
-    // branch never fires today. It is kept (cheaply) for a future
-    // crash-recovery path, and the group-kill it performs matches the
-    // shutdown handler so it can never orphan the child tree if revived.
+    // connections survive. The CLI's only job here is supervision --
+    // block until the child exits on its own and surface the status --
+    // plus clean shutdown of the whole child tree on a signal (below).
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
 
     let mut current_child = initial_child;
-    let respawn_requested = Arc::new(AtomicBool::new(false));
 
     // Track the current child's pid (== its process-group id, set via setpgid)
     // so the shutdown handler can tear down the WHOLE dev-server tree (npx -> tsx
@@ -926,71 +963,23 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
         // code-file changes. Main polls the flag below. (dev only)
         if info.language != "tina4js" {
             let reload_port = port;
-            let watcher_flag = Arc::clone(&respawn_requested);
             std::thread::spawn(move || {
-                watcher::watch_and_reload(reload_port, Some(watcher_flag));
+                watcher::watch_and_reload(reload_port);
             });
         }
     }
 
     // ── Respawn loop ───────────────────────────────────────────────
-    // Polls the current child every 250ms with try_wait() AND checks
-    // the respawn_requested flag. If the flag is set, kill the child
-    // we own and spin up a fresh one. If the child exits naturally
-    // (non-zero), surface the error and bail.
-    let info_clone = info.clone();
-    let host_clone = host.to_string();
+    // Supervision: the CLI owns the child dev server and blocks here until it
+    // exits. File changes hot-reload in-process (the watcher POSTs
+    // /__dev/api/reload — see watcher.rs), so there is nothing to respawn; this
+    // loop only detects the child exiting on its own and surfaces the status.
+    // Clean shutdown on Ctrl-C / SIGTERM / SIGHUP is the ctrlc handler above,
+    // which group-kills the whole child tree via current_pid.
     loop {
-        // Inner poll loop — exits when either:
-        //   (a) child exited naturally (status returned by try_wait)
-        //   (b) watcher set respawn_requested → we kill + break
-        let exit_cause: ExitCause = loop {
-            // Dormant respawn branch (the watcher no longer sets this flag --
-            // see the supervision note above). If ever revived, it kills the
-            // child's whole process GROUP before respawning: Child::kill would
-            // signal only the direct PID (npx), orphaning the tsx -> node
-            // grandchildren. terminate_group reaps the entire tree.
-            if respawn_requested.swap(false, Ordering::SeqCst) {
-                terminate_group(current_child.id());
-                let _ = current_child.wait(); // reap the direct child
-                current_pid.store(0, Ordering::SeqCst);
-                break ExitCause::Respawn;
-            }
-            // Child exited on its own?
-            match current_child.try_wait() {
-                Ok(Some(status)) => break ExitCause::Exited(status),
-                Ok(None) => { /* still running */ }
-                Err(e) => break ExitCause::WaitError(e),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        };
-
-        match exit_cause {
-            ExitCause::Respawn => {
-                println!("{} Respawning {} after code change…",
-                    icon_play().green(), info_clone.cli_name().cyan());
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                match start_language_server(&info_clone, port, &host_clone) {
-                    Some(new_child) => {
-                        current_child = new_child;
-                        current_pid.store(current_child.id() as i32, Ordering::SeqCst);
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        let body = r#"{"type":"reload","file":"<respawn>"}"#;
-                        let url = format!("http://127.0.0.1:{}/__dev/api/reload", port);
-                        let _ = watcher::ureq_post(&url, body);
-                        println!("{} Server ready: {}", icon_ok().green(),
-                            format!("http://localhost:{}", port).cyan());
-                        // Loop back — keep polling the new child
-                    }
-                    None => {
-                        eprintln!("{} Respawn failed — child wouldn't start. Fix the error and re-run.",
-                            icon_fail().red());
-                        std::process::exit(1);
-                    }
-                }
-            }
-            ExitCause::Exited(status) if status.success() => break,
-            ExitCause::Exited(status) => {
+        match current_child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
                 let code = status.code().unwrap_or(-1);
                 eprintln!(
                     "\n{} Server process exited with code {}. Check logs/error.log or your PHP/Python error log for details.",
@@ -999,7 +988,8 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
                 );
                 std::process::exit(code);
             }
-            ExitCause::WaitError(e) => {
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(e) => {
                 eprintln!("\n{} Server process error: {}", icon_fail().red(), e);
                 std::process::exit(1);
             }
@@ -1061,12 +1051,6 @@ fn take_over_port_or_exit(port: u16, dev: bool, no_takeover: bool) {
 
 fn join_pids(pids: &[u32]) -> String {
     pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-}
-
-enum ExitCause {
-    Respawn,
-    Exited(std::process::ExitStatus),
-    WaitError(std::io::Error),
 }
 
 /// Read a variable's raw value from the given `.env` file, surrounding quotes
@@ -2299,7 +2283,23 @@ fn update_framework_package() {
         pkg.cyan()
     );
 
-    let success = match lang {
+    let success = run_framework_update(lang);
+
+    if success {
+        println!("{} {} updated", icon_ok().green(), pkg.cyan());
+    } else {
+        eprintln!(
+            "{} Framework update failed. Check the output above for details.",
+            icon_warn().yellow(),
+        );
+    }
+}
+
+/// Run the per-language framework-package update command, returning true on
+/// success. Split out of update_framework_package so the prompt/report flow
+/// stays readable.
+fn run_framework_update(lang: &str) -> bool {
+    match lang {
         "python" => {
             // Python needs two steps: update lockfile then sync
             let lock_ok = std::process::Command::new("uv")
@@ -2344,15 +2344,6 @@ fn update_framework_package() {
             .map(|s| s.success())
             .unwrap_or(false),
         _ => false,
-    };
-
-    if success {
-        println!("{} {} updated", icon_ok().green(), pkg.cyan());
-    } else {
-        eprintln!(
-            "{} Framework update failed. Check the output above for details.",
-            icon_warn().yellow(),
-        );
     }
 }
 
@@ -3137,6 +3128,15 @@ mod tests {
     // and no undo.
 
     use super::{classify_cli_generation, version_majors, CliGeneration};
+
+    #[test]
+    fn an_explicit_port_always_wins() {
+        // --port is the highest-priority source: it is returned verbatim,
+        // regardless of TINA4_PORT / PORT / .env or the framework default. This
+        // pins the invariant now that the resolution lives in its own function.
+        assert_eq!(super::resolve_requested_port(Some(9999), 7146), 9999);
+        assert_eq!(super::resolve_requested_port(Some(3000), 8080), 3000);
+    }
 
     // ---- self-update integrity: downgrade guard + checksum lookup ---------
     //
