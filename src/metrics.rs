@@ -311,6 +311,31 @@ fn py_halstead(
     operands: &mut Halstead,
 ) {
     let kind = node.kind();
+    let this_bool_op = py_halstead_operator(kind, node, src, parent_bool_op, operators);
+    py_halstead_operand(kind, node, parent_kind, field, src, operands);
+
+    let mut c = node.walk();
+    if c.goto_first_child() {
+        loop {
+            let child = c.node();
+            let child_field = c.field_name();
+            py_halstead(child, Some(kind), child_field, this_bool_op, src, operators, operands);
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+/// Count Python Halstead OPERATORS for one node and report the boolean-op context
+/// to pass down (chained and/or counts once). Split out of py_halstead.
+fn py_halstead_operator(
+    kind: &str,
+    node: Node,
+    src: &[u8],
+    parent_bool_op: Option<&str>,
+    operators: &mut Halstead,
+) -> Option<&'static str> {
     let mut this_bool_op: Option<&str> = None;
     match kind {
         "binary_operator" => {
@@ -341,6 +366,22 @@ fn py_halstead(
                 operators.add(py_aug_name(t));
             }
         }
+        _ => {}
+    }
+    this_bool_op
+}
+
+/// Count Python Halstead OPERANDS (identifiers used as values, literals) for one
+/// node. Split out of py_halstead; operand and operator node-kinds are disjoint.
+fn py_halstead_operand(
+    kind: &str,
+    node: Node,
+    parent_kind: Option<&str>,
+    field: Option<&str>,
+    src: &[u8],
+    operands: &mut Halstead,
+) {
+    match kind {
         "identifier" => {
             if py_identifier_is_operand(parent_kind, field) {
                 operands.add(node.utf8_text(src).unwrap_or("").to_string());
@@ -355,18 +396,6 @@ fn py_halstead(
         "false" => operands.add("False"),
         "none" => operands.add("None"),
         _ => {}
-    }
-
-    let mut c = node.walk();
-    if c.goto_first_child() {
-        loop {
-            let child = c.node();
-            let child_field = c.field_name();
-            py_halstead(child, Some(kind), child_field, this_bool_op, src, operators, operands);
-            if !c.goto_next_sibling() {
-                break;
-            }
-        }
     }
 }
 
