@@ -1210,157 +1210,189 @@ fn resolve_import(
     root_pkg: Option<&str>,
 ) -> Option<String> {
     let dir = parent_dir(from_rel);
-    let mut candidates: Vec<String> = Vec::new();
-    let mut push = |c: String| candidates.push(normalise_path(&c));
-
-    match lang {
-        Lang::Python => {
-            // Leading dots = relative import; each dot climbs one package level.
-            let dots = spec.chars().take_while(|c| *c == '.').count();
-            let tail = spec.trim_start_matches('.').replace('.', "/");
-            if dots > 0 {
-                let mut base = dir.clone();
-                for _ in 1..dots {
-                    base = parent_dir(&base);
-                }
-                let joined = if tail.is_empty() {
-                    base.clone()
-                } else if base.is_empty() {
-                    tail.clone()
-                } else {
-                    format!("{base}/{tail}")
-                };
-                push(format!("{joined}.py"));
-                push(format!("{joined}/__init__.py"));
-            } else {
-                push(format!("{tail}.py"));
-                push(format!("{tail}/__init__.py"));
-                // Absolute intra-package import: `tina4_python.debug` while the
-                // scan root IS tina4_python, so the package prefix is implicit.
-                if let Some(pkg) = root_pkg {
-                    if let Some(rest) = tail.strip_prefix(&format!("{pkg}/")) {
-                        push(format!("{rest}.py"));
-                        push(format!("{rest}/__init__.py"));
-                    }
-                }
-            }
-        }
-        Lang::Ts => {
-            // Only a relative specifier can be internal; bare ones are packages.
-            if !(spec.starts_with('.') || spec.starts_with('/')) {
-                return None;
-            }
-            let joined = if dir.is_empty() {
-                spec.to_string()
-            } else {
-                format!("{dir}/{spec}")
-            };
-            let base = normalise_path(&joined);
-            // TS source may import a ".js" path that is really the ".ts" file.
-            let stem = base
-                .strip_suffix(".js")
-                .or_else(|| base.strip_suffix(".mjs"))
-                .unwrap_or(&base)
-                .to_string();
-            for ext in ["ts", "tsx", "js", "mjs", "jsx"] {
-                push(format!("{stem}.{ext}"));
-                push(format!("{stem}/index.{ext}"));
-            }
-            push(base.clone());
-        }
-        Lang::Ruby => {
-            let cleaned = spec.trim_end_matches(".rb");
-            // require_relative is dir-relative; require is load-path-relative.
-            let joined = if dir.is_empty() {
-                cleaned.to_string()
-            } else {
-                format!("{dir}/{cleaned}")
-            };
-            push(format!("{joined}.rb"));
-            push(format!("{cleaned}.rb"));
-            push(format!("lib/{cleaned}.rb"));
-            if let Some(pkg) = root_pkg {
-                if let Some(rest) = cleaned.strip_prefix(&format!("{pkg}/")) {
-                    push(format!("{rest}.rb"));
-                }
-            }
-        }
-        // Rust resolution, single-crate layout (what this CLI is).
-        //
-        // Two specifier shapes reach here. `mod:agent` is a bodyless `mod`
-        // declaration and names a sibling file directly. Everything else is a
-        // `use` path, where only the leading segment says whether it can be
-        // internal at all: `crate` / `self` / `super` can, a bare first segment
-        // (`std`, `clap`, `serde`) is an external crate and must resolve to None
-        // or every third-party import would be miscounted as internal coupling.
-        //
-        // A `use` path mixes module segments with the ITEM it imports
-        // (`crate::console::icon_ok` = module `console`, item `icon_ok`), and
-        // nothing in the path says where the split is. So each prefix is offered
-        // longest-first and the file set decides.
-        Lang::Rust => {
-            if let Some(m) = spec.strip_prefix("mod:") {
-                let base = if dir.is_empty() { m.to_string() } else { format!("{dir}/{m}") };
-                push(format!("{base}.rs"));
-                push(format!("{base}/mod.rs"));
-            } else {
-                let segs: Vec<&str> = spec.split("::").filter(|s| !s.is_empty()).collect();
-                let first = *segs.first()?;
-                let (mut base, rest): (String, &[&str]) = match first {
-                    // `crate::` is anchored at the crate root, which IS the scan
-                    // root, so the base is empty rather than the current dir.
-                    "crate" => (String::new(), &segs[1..]),
-                    "self" => (dir.clone(), &segs[1..]),
-                    "super" => {
-                        let mut climbed = dir.clone();
-                        let mut i = 0;
-                        while segs.get(i) == Some(&"super") {
-                            climbed = parent_dir(&climbed);
-                            i += 1;
-                        }
-                        (climbed, &segs[i..])
-                    }
-                    _ => return None, // an external crate, excluded by design
-                };
-                if base == "." {
-                    base = String::new();
-                }
-                // Longest prefix first: `console::icon_ok` tries console/icon_ok
-                // before console, so a real nested module always wins over a
-                // same-named item in its parent.
-                for take in (1..=rest.len()).rev() {
-                    let joined = rest[..take].join("/");
-                    let full =
-                        if base.is_empty() { joined.clone() } else { format!("{base}/{joined}") };
-                    push(format!("{full}.rs"));
-                    push(format!("{full}/mod.rs"));
-                }
-            }
-        }
-        Lang::Php => {
-            // A `use` path is a namespace; PSR-4 maps it onto directories.
-            let as_path = spec.trim_start_matches('\\').replace('\\', "/");
-            push(format!("{as_path}.php"));
-            if let Some(pkg) = root_pkg {
-                if let Some(rest) = as_path.strip_prefix(&format!("{pkg}/")) {
-                    push(format!("{rest}.php"));
-                }
-            }
-            // Drop the vendor-style first segment (Tina4\Frond -> Frond.php).
-            if let Some((_, rest)) = as_path.split_once('/') {
-                push(format!("{rest}.php"));
-            }
-            // require/include of a literal path, possibly dir-relative.
-            if !dir.is_empty() {
-                push(format!("{dir}/{as_path}"));
-            }
-            push(as_path.clone());
-        }
-    }
+    let candidates = match lang {
+        Lang::Python => py_resolve_candidates(spec, &dir, root_pkg),
+        Lang::Ts => ts_resolve_candidates(spec, &dir),
+        Lang::Ruby => ruby_resolve_candidates(spec, &dir, root_pkg),
+        Lang::Rust => rust_resolve_candidates(spec, &dir),
+        Lang::Php => php_resolve_candidates(spec, &dir, root_pkg),
+    };
 
     candidates
         .into_iter()
         .find(|c| !c.is_empty() && c != from_rel && paths.contains(c))
+}
+
+/// Python: relative dots climb package levels; absolute names map onto the
+/// scan tree, with the scan root's basename as an implicit package prefix.
+fn py_resolve_candidates(spec: &str, dir: &str, root_pkg: Option<&str>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |c: String| candidates.push(normalise_path(&c));
+    // Leading dots = relative import; each dot climbs one package level.
+    let dots = spec.chars().take_while(|c| *c == '.').count();
+    let tail = spec.trim_start_matches('.').replace('.', "/");
+    if dots > 0 {
+        let mut base = dir.to_string();
+        for _ in 1..dots {
+            base = parent_dir(&base);
+        }
+        let joined = if tail.is_empty() {
+            base.clone()
+        } else if base.is_empty() {
+            tail.clone()
+        } else {
+            format!("{base}/{tail}")
+        };
+        push(format!("{joined}.py"));
+        push(format!("{joined}/__init__.py"));
+    } else {
+        push(format!("{tail}.py"));
+        push(format!("{tail}/__init__.py"));
+        // Absolute intra-package import: `tina4_python.debug` while the
+        // scan root IS tina4_python, so the package prefix is implicit.
+        if let Some(pkg) = root_pkg {
+            if let Some(rest) = tail.strip_prefix(&format!("{pkg}/")) {
+                push(format!("{rest}.py"));
+                push(format!("{rest}/__init__.py"));
+            }
+        }
+    }
+    candidates
+}
+
+/// TypeScript / JS: only a relative specifier can be internal; probe the usual
+/// extensions and index files, and treat a ".js" import as the ".ts" source.
+fn ts_resolve_candidates(spec: &str, dir: &str) -> Vec<String> {
+    // Only a relative specifier can be internal; bare ones are packages.
+    if !(spec.starts_with('.') || spec.starts_with('/')) {
+        return Vec::new();
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |c: String| candidates.push(normalise_path(&c));
+    let joined = if dir.is_empty() {
+        spec.to_string()
+    } else {
+        format!("{dir}/{spec}")
+    };
+    let base = normalise_path(&joined);
+    // TS source may import a ".js" path that is really the ".ts" file.
+    let stem = base
+        .strip_suffix(".js")
+        .or_else(|| base.strip_suffix(".mjs"))
+        .unwrap_or(&base)
+        .to_string();
+    for ext in ["ts", "tsx", "js", "mjs", "jsx"] {
+        push(format!("{stem}.{ext}"));
+        push(format!("{stem}/index.{ext}"));
+    }
+    push(base.clone());
+    candidates
+}
+
+/// Ruby: require_relative is dir-relative; require is load-path-relative.
+fn ruby_resolve_candidates(spec: &str, dir: &str, root_pkg: Option<&str>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |c: String| candidates.push(normalise_path(&c));
+    let cleaned = spec.trim_end_matches(".rb");
+    // require_relative is dir-relative; require is load-path-relative.
+    let joined = if dir.is_empty() {
+        cleaned.to_string()
+    } else {
+        format!("{dir}/{cleaned}")
+    };
+    push(format!("{joined}.rb"));
+    push(format!("{cleaned}.rb"));
+    push(format!("lib/{cleaned}.rb"));
+    if let Some(pkg) = root_pkg {
+        if let Some(rest) = cleaned.strip_prefix(&format!("{pkg}/")) {
+            push(format!("{rest}.rb"));
+        }
+    }
+    candidates
+}
+
+/// Rust resolution, single-crate layout (what this CLI is).
+///
+/// Two specifier shapes reach here. `mod:agent` is a bodyless `mod`
+/// declaration and names a sibling file directly. Everything else is a
+/// `use` path, where only the leading segment says whether it can be
+/// internal at all: `crate` / `self` / `super` can, a bare first segment
+/// (`std`, `clap`, `serde`) is an external crate and must resolve to None
+/// or every third-party import would be miscounted as internal coupling.
+///
+/// A `use` path mixes module segments with the ITEM it imports
+/// (`crate::console::icon_ok` = module `console`, item `icon_ok`), and
+/// nothing in the path says where the split is. So each prefix is offered
+/// longest-first and the file set decides.
+fn rust_resolve_candidates(spec: &str, dir: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |c: String| candidates.push(normalise_path(&c));
+    if let Some(m) = spec.strip_prefix("mod:") {
+        let base = if dir.is_empty() { m.to_string() } else { format!("{dir}/{m}") };
+        push(format!("{base}.rs"));
+        push(format!("{base}/mod.rs"));
+    } else {
+        let segs: Vec<&str> = spec.split("::").filter(|s| !s.is_empty()).collect();
+        let first = match segs.first() {
+            Some(s) => *s,
+            None => return Vec::new(),
+        };
+        let (mut base, rest): (String, &[&str]) = match first {
+            // `crate::` is anchored at the crate root, which IS the scan
+            // root, so the base is empty rather than the current dir.
+            "crate" => (String::new(), &segs[1..]),
+            "self" => (dir.to_string(), &segs[1..]),
+            "super" => {
+                let mut climbed = dir.to_string();
+                let mut i = 0;
+                while segs.get(i) == Some(&"super") {
+                    climbed = parent_dir(&climbed);
+                    i += 1;
+                }
+                (climbed, &segs[i..])
+            }
+            _ => return Vec::new(), // an external crate, excluded by design
+        };
+        if base == "." {
+            base = String::new();
+        }
+        // Longest prefix first: `console::icon_ok` tries console/icon_ok
+        // before console, so a real nested module always wins over a
+        // same-named item in its parent.
+        for take in (1..=rest.len()).rev() {
+            let joined = rest[..take].join("/");
+            let full =
+                if base.is_empty() { joined.clone() } else { format!("{base}/{joined}") };
+            push(format!("{full}.rs"));
+            push(format!("{full}/mod.rs"));
+        }
+    }
+    candidates
+}
+
+/// PHP: a `use` path is a PSR-4 namespace mapped onto directories; also
+/// handles require/include literals, possibly dir-relative.
+fn php_resolve_candidates(spec: &str, dir: &str, root_pkg: Option<&str>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |c: String| candidates.push(normalise_path(&c));
+    // A `use` path is a namespace; PSR-4 maps it onto directories.
+    let as_path = spec.trim_start_matches('\\').replace('\\', "/");
+    push(format!("{as_path}.php"));
+    if let Some(pkg) = root_pkg {
+        if let Some(rest) = as_path.strip_prefix(&format!("{pkg}/")) {
+            push(format!("{rest}.php"));
+        }
+    }
+    // Drop the vendor-style first segment (Tina4\Frond -> Frond.php).
+    if let Some((_, rest)) = as_path.split_once('/') {
+        push(format!("{rest}.php"));
+    }
+    // require/include of a literal path, possibly dir-relative.
+    if !dir.is_empty() {
+        push(format!("{dir}/{as_path}"));
+    }
+    push(as_path.clone());
+    candidates
 }
 
 // ── Analyze one source string ─────────────────────────────────────────────────
