@@ -99,13 +99,6 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// Atomic flag the watcher SETS when it detects a code-file change.
-/// Main's serve loop polls this flag (via try_wait + check) and, when
-/// it sees the flag set, kills the child it owns + respawns. Decouples
-/// the watcher from the child's lifecycle (the watcher doesn't need
-/// to own a reference to the child — it just shouts "restart please").
-type RespawnHandle = std::sync::Arc<std::sync::atomic::AtomicBool>;
-
 fn is_code_change(file: &str) -> bool {
     // Files that require a process restart because language runtimes
     // cache modules in memory. CSS/SCSS/template changes go via the
@@ -124,7 +117,7 @@ fn is_code_change(file: &str) -> bool {
 /// the child process (main's respawn loop spins up a fresh one). On
 /// asset changes (CSS/SCSS/templates), POST /__dev/api/reload so the
 /// framework signals the browser to soft-reload. Blocks forever.
-pub fn watch_and_reload(port: u16, _respawn: Option<RespawnHandle>) {
+pub fn watch_and_reload(port: u16) {
     let (tx, rx) = mpsc::channel();
     // Use PollWatcher instead of RecommendedWatcher (FSEvents on macOS)
     // because FSEvents stops delivering events when the parent process
