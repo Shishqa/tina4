@@ -80,7 +80,7 @@ fn base_url() -> String {
 /// Per-user config directory for Tina4. Windows: `%APPDATA%\tina4`. Elsewhere:
 /// `$XDG_CONFIG_HOME/tina4`, else `$HOME/.config/tina4`. Mirrors how doctor.rs
 /// resolves HOME; no extra crate.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)

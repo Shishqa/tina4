@@ -22,6 +22,7 @@ mod scss;
 mod session;
 mod setup;
 mod skills;
+mod uninstall;
 mod upgrade;
 mod watcher;
 
@@ -187,6 +188,19 @@ enum Commands {
     /// Self-update the tina4 binary and refresh installed Tina4 AI skills
     #[command(alias = "upgrade")]
     Update,
+
+    /// Remove everything the client put on this machine: config + credentials,
+    /// the installed Tina4 AI skills, and the binary itself. Lists exactly what
+    /// it will touch and asks before removing anything (unless --yes); --dry-run
+    /// only reports. Offers to clean this project's .tina4/ too.
+    Uninstall {
+        /// Show what would be removed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not prompt for confirmation (for scripts)
+        #[arg(long)]
+        yes: bool,
+    },
 
     /// Download the Tina4 book into the current directory
     Books,
@@ -443,6 +457,8 @@ fn main() {
         Commands::IWantToStopUsingV2AndSwitchToV3 => upgrade::run(),
 
         Commands::Update => handle_update(),
+
+        Commands::Uninstall { dry_run, yes } => uninstall::run(dry_run, yes),
 
         Commands::Books => handle_books(),
         Commands::Docs => handle_docs(),
