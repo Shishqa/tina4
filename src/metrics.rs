@@ -995,155 +995,11 @@ fn extract_import_specs(root: Node, lang: Lang, src: &[u8]) -> Vec<String> {
     while let Some(node) = stack.pop() {
         let kind = node.kind();
         match lang {
-            Lang::Python if kind == "import_from_statement" => {
-                // `from X import y` -> X (may be relative: `.`, `..pkg`)
-                if let Some(m) = node.child_by_field_name("module_name") {
-                    if let Ok(t) = m.utf8_text(src) {
-                        specs.push(t.trim().to_string());
-                    }
-                } else if let Ok(t) = node.utf8_text(src) {
-                    // bare `from . import x` — module_name absent in some grammars
-                    if let Some(rest) = t.trim().strip_prefix("from ") {
-                        let dots: String =
-                            rest.chars().take_while(|c| *c == '.').collect();
-                        if !dots.is_empty() {
-                            specs.push(dots);
-                        }
-                    }
-                }
-            }
-            Lang::Python if kind == "import_statement" => {
-                // `import a.b, c` -> each dotted_name
-                let mut c = node.walk();
-                for child in node.children(&mut c) {
-                    match child.kind() {
-                        "dotted_name" => {
-                            if let Ok(t) = child.utf8_text(src) {
-                                specs.push(t.trim().to_string());
-                            }
-                        }
-                        "aliased_import" => {
-                            if let Some(n) = child.child_by_field_name("name") {
-                                if let Ok(t) = n.utf8_text(src) {
-                                    specs.push(t.trim().to_string());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Lang::Ts if kind == "import_statement" => {
-                if let Some(s) = node.child_by_field_name("source") {
-                    if let Ok(t) = s.utf8_text(src) {
-                        specs.push(unquote(t));
-                    }
-                } else if let Some(s) = first_string_literal(node, src) {
-                    specs.push(s);
-                }
-            }
-            Lang::Ts if kind == "call_expression" => {
-                let function = node
-                    .child_by_field_name("function")
-                    .and_then(|function| function.utf8_text(src).ok())
-                    .unwrap_or("");
-                if matches!(function, "import" | "require") {
-                    if let Some(specifier) = first_string_literal(node, src) {
-                        specs.push(specifier);
-                    }
-                }
-            }
-            // `use Tina4\Frond;` and `use Tina4\{A, B};` nest the path one level
-            // down, inside a namespace_use_clause / -group-clause - matching only
-            // the outer declaration's DIRECT children found nothing at all, which
-            // is why PHP produced zero edges across 138 files.
-            Lang::Php
-                if matches!(kind, "namespace_use_clause" | "namespace_use_group_clause") =>
-            {
-                let mut c = node.walk();
-                for child in node.children(&mut c) {
-                    if child.kind().contains("qualified_name") || child.kind() == "name" {
-                        if let Ok(t) = child.utf8_text(src) {
-                            let t = t.trim();
-                            if !t.is_empty() {
-                                specs.push(t.to_string());
-                            }
-                            break; // the first name is the path; the rest is `as Alias`
-                        }
-                    }
-                }
-            }
-            Lang::Php
-                if matches!(
-                    kind,
-                    "require_once_expression"
-                        | "require_expression"
-                        | "include_expression"
-                        | "include_once_expression"
-                ) =>
-            {
-                if let Some(s) = first_string_literal(node, src) {
-                    specs.push(s);
-                }
-            }
-            // PHP's DOMINANT idiom is not `use` at all - it is an inline
-            // fully-qualified reference, `\Tina4\Database::create(...)`, resolved
-            // by the autoloader. In the real framework that is 243 references
-            // against 72 `use` statements, so counting only `use` understated
-            // PHP coupling by roughly 3-4x. A namespaced reference IS a
-            // dependency; require a backslash so bare function calls are ignored.
-            Lang::Php if kind.contains("qualified_name") => {
-                if let Ok(t) = node.utf8_text(src) {
-                    let t = t.trim();
-                    if t.contains('\\') && t.len() > 1 {
-                        specs.push(t.to_string());
-                    }
-                }
-            }
-            // `use crate::console::icon_ok;` -> "crate::console::icon_ok". The
-            // whole path is kept as written and narrowed to a file in
-            // `resolve_import`, which is the only place that knows the file set.
-            Lang::Rust if kind == "use_declaration" => {
-                if let Some(arg) = node.child_by_field_name("argument") {
-                    if let Ok(t) = arg.utf8_text(src) {
-                        // `use std::{fs, io}` -> keep the `std::` stem only; a
-                        // brace group is always external here (an intra-crate
-                        // group would still resolve through its stem).
-                        let head = t.split('{').next().unwrap_or(t).trim().trim_end_matches("::");
-                        if !head.is_empty() {
-                            specs.push(head.to_string());
-                        }
-                    }
-                }
-            }
-            // `mod agent;` with NO body is a declaration that agent.rs (or
-            // agent/mod.rs) is part of this crate - the strongest internal edge
-            // Rust has, and the one that wires main.rs to every other file in
-            // this CLI. `mod x { .. }` with a body is an inline module and no
-            // edge at all, so the bodyless form is what qualifies.
-            Lang::Rust if kind == "mod_item" && node.child_by_field_name("body").is_none() => {
-                if let Some(n) = node.child_by_field_name("name") {
-                    if let Ok(t) = n.utf8_text(src) {
-                        specs.push(format!("mod:{}", t.trim()));
-                    }
-                }
-            }
-            Lang::Ruby if kind == "call" => {
-                if let Some(m) = node
-                    .child_by_field_name("method")
-                    .and_then(|n| n.utf8_text(src).ok())
-                {
-                    if matches!(m, "require" | "require_relative" | "load" | "autoload") {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            if let Some(s) = first_string_literal(args, src) {
-                                // `autoload :Sym, "path"` -> the path is the literal
-                                specs.push(s);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
+            Lang::Python => py_import_specs(node, kind, src, &mut specs),
+            Lang::Ts => ts_import_specs(node, kind, src, &mut specs),
+            Lang::Php => php_import_specs(node, kind, src, &mut specs),
+            Lang::Rust => rust_import_specs(node, kind, src, &mut specs),
+            Lang::Ruby => ruby_import_specs(node, kind, src, &mut specs),
         }
         let mut c = node.walk();
         for child in node.children(&mut c) {
@@ -1156,6 +1012,165 @@ fn extract_import_specs(root: Node, lang: Lang, src: &[u8]) -> Vec<String> {
     specs.sort();
     specs.dedup();
     specs
+}
+
+/// Python import specifiers for one AST node (split out of extract_import_specs).
+fn py_import_specs(node: Node, kind: &str, src: &[u8], specs: &mut Vec<String>) {
+    if kind == "import_from_statement" {
+        // `from X import y` -> X (may be relative: `.`, `..pkg`)
+        if let Some(m) = node.child_by_field_name("module_name") {
+            if let Ok(t) = m.utf8_text(src) {
+                specs.push(t.trim().to_string());
+            }
+        } else if let Ok(t) = node.utf8_text(src) {
+            // bare `from . import x` — module_name absent in some grammars
+            if let Some(rest) = t.trim().strip_prefix("from ") {
+                let dots: String =
+                    rest.chars().take_while(|c| *c == '.').collect();
+                if !dots.is_empty() {
+                    specs.push(dots);
+                }
+            }
+        }
+    }
+    if kind == "import_statement" {
+        // `import a.b, c` -> each dotted_name
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            match child.kind() {
+                "dotted_name" => {
+                    if let Ok(t) = child.utf8_text(src) {
+                        specs.push(t.trim().to_string());
+                    }
+                }
+                "aliased_import" => {
+                    if let Some(n) = child.child_by_field_name("name") {
+                        if let Ok(t) = n.utf8_text(src) {
+                            specs.push(t.trim().to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// TypeScript/JS import specifiers for one AST node.
+fn ts_import_specs(node: Node, kind: &str, src: &[u8], specs: &mut Vec<String>) {
+    if kind == "import_statement" {
+        if let Some(s) = node.child_by_field_name("source") {
+            if let Ok(t) = s.utf8_text(src) {
+                specs.push(unquote(t));
+            }
+        } else if let Some(s) = first_string_literal(node, src) {
+            specs.push(s);
+        }
+    }
+    if kind == "call_expression" {
+        let function = node
+            .child_by_field_name("function")
+            .and_then(|function| function.utf8_text(src).ok())
+            .unwrap_or("");
+        if matches!(function, "import" | "require") {
+            if let Some(specifier) = first_string_literal(node, src) {
+                specs.push(specifier);
+            }
+        }
+    }
+}
+
+/// PHP import specifiers for one AST node (use-clauses, require/include, and the
+/// dominant inline fully-qualified reference idiom).
+fn php_import_specs(node: Node, kind: &str, src: &[u8], specs: &mut Vec<String>) {
+    // `use Tina4\Frond;` and `use Tina4\{A, B};` nest the path one level
+    // down, inside a namespace_use_clause / -group-clause - matching only
+    // the outer declaration's DIRECT children found nothing at all, which
+    // is why PHP produced zero edges across 138 files.
+    if matches!(kind, "namespace_use_clause" | "namespace_use_group_clause") {
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            if child.kind().contains("qualified_name") || child.kind() == "name" {
+                if let Ok(t) = child.utf8_text(src) {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        specs.push(t.to_string());
+                    }
+                    break; // the first name is the path; the rest is `as Alias`
+                }
+            }
+        }
+    }
+    if matches!(kind, "require_once_expression" | "require_expression" | "include_expression" | "include_once_expression") {
+        if let Some(s) = first_string_literal(node, src) {
+            specs.push(s);
+        }
+    }
+    // PHP's DOMINANT idiom is not `use` at all - it is an inline
+    // fully-qualified reference, `\Tina4\Database::create(...)`, resolved
+    // by the autoloader. In the real framework that is 243 references
+    // against 72 `use` statements, so counting only `use` understated
+    // PHP coupling by roughly 3-4x. A namespaced reference IS a
+    // dependency; require a backslash so bare function calls are ignored.
+    if kind.contains("qualified_name") {
+        if let Ok(t) = node.utf8_text(src) {
+            let t = t.trim();
+            if t.contains('\\') && t.len() > 1 {
+                specs.push(t.to_string());
+            }
+        }
+    }
+}
+
+/// Rust import specifiers for one AST node (use-declarations and bodyless mod items).
+fn rust_import_specs(node: Node, kind: &str, src: &[u8], specs: &mut Vec<String>) {
+    // `use crate::console::icon_ok;` -> "crate::console::icon_ok". The
+    // whole path is kept as written and narrowed to a file in
+    // `resolve_import`, which is the only place that knows the file set.
+    if kind == "use_declaration" {
+        if let Some(arg) = node.child_by_field_name("argument") {
+            if let Ok(t) = arg.utf8_text(src) {
+                // `use std::{fs, io}` -> keep the `std::` stem only; a
+                // brace group is always external here (an intra-crate
+                // group would still resolve through its stem).
+                let head = t.split('{').next().unwrap_or(t).trim().trim_end_matches("::");
+                if !head.is_empty() {
+                    specs.push(head.to_string());
+                }
+            }
+        }
+    }
+    // `mod agent;` with NO body is a declaration that agent.rs (or
+    // agent/mod.rs) is part of this crate - the strongest internal edge
+    // Rust has, and the one that wires main.rs to every other file in
+    // this CLI. `mod x { .. }` with a body is an inline module and no
+    // edge at all, so the bodyless form is what qualifies.
+    if kind == "mod_item" && node.child_by_field_name("body").is_none() {
+        if let Some(n) = node.child_by_field_name("name") {
+            if let Ok(t) = n.utf8_text(src) {
+                specs.push(format!("mod:{}", t.trim()));
+            }
+        }
+    }
+}
+
+/// Ruby import specifiers for one AST node (require/require_relative/load/autoload).
+fn ruby_import_specs(node: Node, kind: &str, src: &[u8], specs: &mut Vec<String>) {
+    if kind == "call" {
+        if let Some(m) = node
+            .child_by_field_name("method")
+            .and_then(|n| n.utf8_text(src).ok())
+        {
+            if matches!(m, "require" | "require_relative" | "load" | "autoload") {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    if let Some(s) = first_string_literal(args, src) {
+                        // `autoload :Sym, "path"` -> the path is the literal
+                        specs.push(s);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Normalise a candidate path: drop `./`, collapse `a/../b`, unify separators.
