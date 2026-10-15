@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.8.99 - 2026-10-15
+
+- feat(cli): `tina4 uninstall` removes everything the client put on the machine - the config and credentials, the installed Tina4 AI skills across Claude, Codex and Cursor, and the binary itself. It lists every target first and asks before it removes anything; `--dry-run` only reports and `--yes` skips the prompts. The current project's own `.tina4/`, `.tina4-metrics.json` and `.tina4-docs` are a separate, explicit opt-in, so an uninstall never searches the rest of the filesystem (#84).
+- refactor: a code-quality batch across the metrics engine, doctor, watcher and serve supervision - import resolution, Halstead scoring and filesystem-event handling split into focused helpers, and the dead respawn machinery removed - with no behaviour change (#73-#83).
+
 ## 3.8.96 — 2026-10-04
 
 - fix(skills): `tina4 skills` / `tina4 update` now install the CURRENT published skills. The native installer carried a hardcoded 8-skill list and a baked `3.13.138` ref, so it could neither advance to a newer ref nor install a newly added skill - it attempted an 8-skill install against the 9-skill `3.13.146` ref and failed checksum. It is now data-driven: the ref is resolved from the served `install-skills.sh` (so a skills release reaches `tina4 update` with no CLI release), and the exact file set is derived from the published `skills.sha256` manifest (any skills, any one-level-nested references). CDN-fallback repo routing is a rule, not a list, so a new skill needs no change here and a wrong guess only loses the fallback, never the primary tier. Guards added so the installer can never again drift from the manifest (#60).
