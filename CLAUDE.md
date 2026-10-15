@@ -150,6 +150,16 @@ tina4 deploy <target> [--runtime R]
                                  docker-entrypoint.fpm.sh for fpm. --runtime on a
                                  non-PHP project is REFUSED, not ignored.
 tina4 update                     Self-update the binary
+tina4 uninstall [--dry-run] [--yes]
+                                 Remove everything tina4 put on this machine: the
+                                 config + credentials, the installed AI skills (the
+                                 tina4-* folders + .tina4-skills-ref marker across
+                                 ~/.claude, ~/.agents, ~/.cursor), and the binary
+                                 itself. Lists every target first and asks before it
+                                 removes anything. --dry-run only reports; --yes skips
+                                 the prompts. The current project's ./.tina4,
+                                 .tina4-metrics.json and .tina4-docs are offered as a
+                                 separate, explicit opt-in - no filesystem-wide search.
 ```
 
 ## Windows `tina4 setup` — the "drops to the prompt" symptom (RESOLVED in 3.8.40)
