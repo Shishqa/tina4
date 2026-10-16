@@ -1,96 +1,147 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""Exercise the installer's actual platform/asset selection without downloading.
+"""Run the whole installer against a real local HTTP fixture server.
 
-Run: python3 -m unittest discover -s tests -p 'test_install_platform.py' -v
-No network or external services are substituted: only the local shell selection
-blocks are evaluated, using release asset names as input.
+Only download origins are redirected in a temporary copy. A uname fixture
+selects OS/architecture independently of the CI host. No shell code is extracted.
+Run: python3 tests/test_install_platform.py -v
 """
+import hashlib
+import http.server
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 
 
 INSTALLER = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-DETECTION = INSTALLER.split("# Helper: download a URL to stdout", 1)[0]
-SELECTION = INSTALLER.split("# Match the correct binary from release assets.", 1)[1]
-SELECTION = SELECTION.split('URL="https://github.com/', 1)[0]
-HOST = os.uname() if hasattr(os, "uname") else None
-ARCH = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64"}.get(HOST.machine if HOST else "")
+SHELL = shutil.which("sh")
 
 
-@unittest.skipUnless(HOST and HOST.sysname == "Linux" and ARCH, "requires supported Linux host")
+@unittest.skipUnless(os.name == "posix" and SHELL and shutil.which("curl"), "requires POSIX shell and curl")
 class InstallPlatformTests(unittest.TestCase):
-    def select(self, variables=None, assets=None):
+    @classmethod
+    def setUpClass(cls):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = self.server.fixtures.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.end_headers()
+                self.wfile.write(body if body is not None else b"not found")
+
+            def log_message(self, *_args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.server.fixtures = {}
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def install(self, variables=None, arch="aarch64", assets=None, corrupt_checksum=False):
         env = os.environ.copy()
         for name in ("TERMUX_VERSION", "ANDROID_ROOT", "PREFIX", "TINA4_INSTALL_DIR"):
             env.pop(name, None)
-        with tempfile.TemporaryDirectory() as home:
-            env["HOME"] = home
-            env.update(variables or {})
-            env["LATEST"] = "v-test"
-            env["RELEASE_JSON"] = json.dumps({"assets": [
-                {"name": name} for name in (assets if assets is not None else [
-                    f"tina4-linux-{ARCH}", f"tina4-linux-musl-{ARCH}",
-                ])
-            ]}, indent=2)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env["HOME"] = str(root)
+            env["TMPDIR"] = str(root)
+            env.update({key: value.replace("{root}", directory) for key, value in (variables or {}).items()})
+            bindir = root / "tools"
+            bindir.mkdir()
+            uname = bindir / "uname"
+            uname.write_text(f'#!{SHELL}\ncase "$1" in -s) echo Linux;; -m) echo {arch};; esac\n')
+            uname.chmod(0o755)
+            env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
+            names = assets if assets is not None else [
+                f"tina4-linux{libc}-{cpu}"
+                for libc in ("", "-musl") for cpu in ("amd64", "arm64")
+            ]
+            binary = f"#!{SHELL}\necho fixture-cli\n".encode()
+            digest = "0" * 64 if corrupt_checksum else hashlib.sha256(binary).hexdigest()
+            release = "/tina4stack/tina4/releases/download/v-test/"
+            self.server.fixtures = {
+                "/repos/tina4stack/tina4/releases/latest": json.dumps({
+                    "tag_name": "v-test", "assets": [{"name": name} for name in names],
+                }, indent=2).encode(),
+                release + "SHA256SUMS": "".join(f"{digest}  {name}\n" for name in names).encode(),
+                **{release + name: binary for name in names},
+            }
+            origin = f"http://127.0.0.1:{self.server.server_port}/"
+            installer = root / "install.sh"
+            installer.write_text(INSTALLER.replace("https://api.github.com/", origin)
+                                 .replace("https://github.com/", origin))
             result = subprocess.run(
-                ["sh", "-c", DETECTION + SELECTION +
-                 '\nprintf "%s\\n" "$PLATFORM" "$INSTALL_DIR" "$BINARY"\n'],
-                env=env, text=True, capture_output=True,
+                [SHELL, str(installer)], env=env, text=True, capture_output=True,
+                stdin=subprocess.DEVNULL, start_new_session=True, timeout=30,
             )
-            return result, home
+            destination = Path(env.get("TINA4_INSTALL_DIR") or
+                               (env["PREFIX"] + "/bin" if env.get("PREFIX") else root / ".local/bin"))
+            installed = destination / "tina4"
+            if result.returncode == 0:
+                self.assertEqual(installed.read_bytes(), binary)
+                self.assertTrue(os.access(installed, os.X_OK))
+                self.assertEqual(subprocess.check_output([str(installed)], text=True), "fixture-cli\n")
+            else:
+                self.assertFalse(installed.exists())
+            return result, str(destination)
 
-    def test_regular_linux_keeps_glibc_and_system_directory(self):
-        result, _ = self.select()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "linux", "/usr/local/bin", f"tina4-linux-{ARCH}",
-        ])
-
-    def test_termux_uses_static_binary_and_prefix(self):
-        result, _ = self.select({"TERMUX_VERSION": "0.118.3", "PREFIX": "/termux/usr"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "linux-musl", "/termux/usr/bin", f"tina4-linux-musl-{ARCH}",
-        ])
+    def test_termux_selects_musl_on_both_architectures_and_aliases(self):
+        for arch, asset in (("aarch64", "arm64"), ("arm64", "arm64"),
+                            ("x86_64", "amd64"), ("amd64", "amd64")):
+            with self.subTest(arch=arch):
+                result, destination = self.install({"TERMUX_VERSION": "0.118.3", "PREFIX": "{root}/usr"}, arch)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"Downloading tina4-linux-musl-{asset}...", result.stdout)
+                self.assertTrue(destination.endswith("/usr/bin"))
 
     def test_android_without_termux_uses_user_directory(self):
-        result, home = self.select({"ANDROID_ROOT": "/system"})
+        result, destination = self.install({"ANDROID_ROOT": "/system"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "linux-musl", f"{home}/.local/bin", f"tina4-linux-musl-{ARCH}",
-        ])
+        self.assertIn("Downloading tina4-linux-musl-arm64...", result.stdout)
+        self.assertTrue(destination.endswith("/.local/bin"))
 
     def test_termux_without_prefix_uses_user_directory(self):
-        result, home = self.select({"TERMUX_VERSION": "0.118.3"})
+        result, destination = self.install({"TERMUX_VERSION": "0.118.3"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], f"{home}/.local/bin")
+        self.assertTrue(destination.endswith("/.local/bin"))
 
     def test_explicit_directory_takes_precedence(self):
-        for variables in ({}, {"TERMUX_VERSION": "0.118.3", "PREFIX": "/termux/usr"}):
+        result, destination = self.install({"TERMUX_VERSION": "0.118.3", "PREFIX": "{root}/usr",
+                                            "TINA4_INSTALL_DIR": "{root}/custom/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(destination.endswith("/custom/bin"))
+
+    def test_regular_linux_keeps_glibc(self):
+        for variables in ({}, {"PREFIX": "{root}/prefix"}, {"TERMUX_VERSION": "", "ANDROID_ROOT": ""}):
             with self.subTest(variables=variables):
-                result, _ = self.select({**variables, "TINA4_INSTALL_DIR": "/custom/bin"})
+                result, _ = self.install({**variables, "TINA4_INSTALL_DIR": "{root}/bin"})
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines()[1], "/custom/bin")
-
-    def test_prefix_alone_does_not_mean_android(self):
-        result, _ = self.select({"PREFIX": "/usr/local"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[0], "linux")
-
-    def test_empty_android_variables_do_not_mean_android(self):
-        result, _ = self.select({"TERMUX_VERSION": "", "ANDROID_ROOT": ""})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[0], "linux")
+                self.assertIn("Downloading tina4-linux-arm64...", result.stdout)
 
     def test_android_refuses_glibc_fallback_when_musl_missing(self):
-        result, _ = self.select({"ANDROID_ROOT": "/system"}, [f"tina4-linux-{ARCH}"])
+        result, _ = self.install({"ANDROID_ROOT": "/system"}, assets=["tina4-linux-arm64"])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No matching binary found for linux-musl/", result.stderr)
+
+    def test_checksum_mismatch_does_not_install(self):
+        result, _ = self.install({"TERMUX_VERSION": "0.118.3"}, corrupt_checksum=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checksum mismatch", result.stderr)
+
+    def test_unsupported_architecture_does_not_install(self):
+        result, _ = self.install({"TERMUX_VERSION": "0.118.3"}, arch="armv7l")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported architecture", result.stderr)
 
 
 if __name__ == "__main__":
